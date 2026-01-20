@@ -1,0 +1,89 @@
+# Blending.yaml
+name: RISE_blending
+
+# Point cloud shape
+pointcloud_shape: [92160, 6]  # max_points, XYZRGB
+dataset_path: /home/nscl/diffusion_policy/data/cube_stack/recorder_data
+
+shape_meta: &shape_meta
+  # acceptable types: pointcloud, low_dim
+  obs:
+    pointcloud:
+      shape: ${task.pointcloud_shape}
+      type: pointcloud
+  action:
+    shape: [7]  # 6DOF + gripper
+
+
+env_runner:
+  _target_: pcdp.env_runner.RISE_runner.RISEPointCloudRunner
+
+dataset:
+  _target_: pcdp.dataset.Blending_dataset.BlendingDataset
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  horizon: ${horizon}
+  n_obs_steps: ${dataset_obs_steps}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_latency_steps: ${n_latency_steps}
+
+  use_cache: True
+  voxel_size: 0.005
+  downsample_factor: 6
+  downsample_use_all_offsets: False
+  group_by_offsets: False
+  seed: 233
+  val_ratio: 0.0
+  max_train_episodes: null
+  aug: False
+  aug_trans_min: [-0.2, -0.2, -0.2]
+  aug_trans_max: [0.2, 0.2, 0.2]
+  aug_rot_min: [-30, -30, -30]
+  aug_rot_max: [30, 30, 30]
+  aug_jitter: False
+  aug_jitter_params: [0.4, 0.4, 0.2, 0.1]
+  aug_jitter_prob: 0.2
+  enable_blending: True  # Femto Bolt + D405 blending
+
+  enable_pc_preprocessing: True
+  pc_preprocessor_config:
+    enable_transform: True
+    enable_cropping: True
+    enable_sampling: False
+    target_num_points: 1024
+    enable_filter: True  # ROR filter enabled
+    filter_type: ror
+    enable_occlusion_prune: False
+    # SOR parameters
+    nb_points: 10
+    sor_std: 1.7
+    # ROR parameters
+    ror_nb_points: 12
+    ror_radius: 0.01  # meter
+    use_cuda: True
+    verbose: False
+    enable_temporal: False
+
+    # Camera to robot transformation matrix (4x4)
+    # Femto Bolt camera frame → Base frame
+    extrinsics_matrix:
+      - [  0.007131,  -0.91491,    0.403594,  0.05116]
+      - [ -0.994138,   0.003833,   0.02656,  -0.00918]
+      - [ -0.025717,  -0.403641,  -0.914552, 0.50821]
+      - [ 0.,         0. ,        0. ,        1.    ]
+
+    # Workspace bounds in meters (Base frame)
+    workspace_bounds:
+      - [-0.132, 0.715]    # X range (meters)
+      - [-0.400, 0.350]    # Y range (meters)
+      - [-0.100, 0.600]    # Z range (meters)
+
+  enable_low_dim_preprocessing: True
+  low_dim_preprocessor_config:
+    # Base frame → Robot base frame
+    robot_to_base:
+      - [1., 0., 0., -0.04]
+      - [0., 1., 0., -0.29]
+      - [0., 0., 1., -0.03]
+      - [0., 0., 0., 1.]

@@ -1,0 +1,111 @@
+# train_diffusion_RISE_blending_workspace.yaml
+defaults:
+  - task: Blending
+
+name: train_diffusion_Blending_cube_stack
+_target_: pcdp.workspace.train_diffusion_RISE_workspace.TrainRISEWorkspace
+
+task_name: ${task.name}
+exp_name: "RISE_Blending"
+
+horizon: 20
+n_obs_steps: 1
+n_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+keypoint_visible_rate: 1.0
+obs_as_global_cond: True
+
+policy:
+  _target_: pcdp.policy.diffusion_RISE_policy.RISEPolicy
+  num_action: 20
+  input_dim: 6
+  obs_feature_dim: 512
+  hidden_dim: 512
+  nheads: 8
+  num_encoder_layers: 4
+  num_decoder_layers: 1
+  dropout: 0.1
+
+ema:
+  _target_: pcdp.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 120
+  num_workers: 15
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+  drop_last: True
+
+val_dataloader:
+  batch_size: 128
+  num_workers: 10
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+  drop_last: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 3.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 233
+  debug: False
+  resume: False
+  lr_warmup_steps: 1000
+  num_epochs: 1
+  use_ema: False
+  rollout_every: 1
+  save_epochs: 20
+  tqdm_interval_sec: 1.0
+  validation_every: 5
+  # normalize
+  translation:
+    - [-0.142, 0.585]    # X range (meters)
+    - [-0.500, 0.330]   # Y range (meters)
+    - [-0.085, 0.470]    # Z range (meters)
+
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: "Cube_Stack_${now:%Y.%m.%d}-(Raw_Data, Blending, Downsample: 6, batch_size: 120)"
+  project: RISE_Blending
+  resume: false
+  tags:
+  - RISE_Blending
+  - Raw_Data
+  - Femto_D405
+
+
+checkpoint:
+  save_ckpt: True
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
