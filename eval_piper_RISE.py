@@ -122,20 +122,11 @@ def main(input, output, match_episode, frequency, save_data):
     dt = 1.0 / frequency
     voxel_size = cfg.task.dataset.voxel_size
 
-    # URDF 및 IK 파라미터 설정
-    urdf_path = "/home/moai/pcdp/dependencies/piper_description/urdf/piper_no_gripper_description.urdf"
-    mesh_dir = "/home/moai/pcdp/dependencies"
-    ee_link_name = "link6"
-
     with SharedMemoryManager() as shm_manager:
         with KeystrokeCounter() as key_counter, \
             TeleoperationPiper(shm_manager=shm_manager) as teleop, \
             RealEnv(
-                output_dir=output, 
-                urdf_path=urdf_path,
-                mesh_dir=mesh_dir,
-                ee_link_name=ee_link_name,
-                joints_to_lock_names=[],
+                output_dir=output,
                 frequency=frequency,
                 init_joints=True,
                 orbbec_mode="C2D",

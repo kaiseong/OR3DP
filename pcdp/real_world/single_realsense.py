@@ -63,17 +63,30 @@ class SingleRealSense(mp.Process):
     def __init__(
         self,
         shm_manager: SharedMemoryManager,
-        resolution=(1280, 720),
+        resolution=(424, 240),
         put_fps=60,
-        num_downsample=16384,
         get_max_k=60,
-        verbose=False
+        verbose=False,
+        # Depth filter parameters (applied during data collection)
+        # Threshold + Spatial filters are applied and SAVED to depth_image
+        # Voxel downsampling is applied later during training/inference
+        enable_threshold_filter=True,
+        threshold_min_dist=0.04,  # meter
+        threshold_max_dist=0.20,  # meter
+        enable_spatial_filter=True,
+        spatial_magnitude=2,      # 반복 횟수 (1~5)
+        spatial_smooth_alpha=0.7, # 필터 강도 (0.25~1.0)
+        spatial_smooth_delta=15   # Edge 감지 임계값 (1~50)
     ):
         super().__init__()
-        
+
         # create ring buffer
         examples = dict()
-        examples['pointcloud'] = np.empty(shape=(num_downsample, 6), dtype=np.float32)
+        # pointcloud field kept for backward compatibility but not used (fixed small size)
+        examples['pointcloud'] = np.empty(shape=(1, 6), dtype=np.float32)
+        examples['depth_image'] = np.empty(shape=resolution[::-1], dtype=np.uint16)
+        examples['color_image'] = np.empty(shape=resolution[::-1] + (3,), dtype=np.uint8)
+        examples['intrinsics'] = np.empty(shape=(4,), dtype=np.float32)  # [fx, fy, cx, cy]
         examples['camera_capture_timestamp'] = 0.0
         examples['camera_receive_timestamp'] = 0.0
         examples['timestamp'] = 0.0
@@ -83,7 +96,7 @@ class SingleRealSense(mp.Process):
             shm_manager=shm_manager,
             examples=examples,
             get_max_k=get_max_k,
-            get_time_budget=0.025,
+            get_time_budget=0.05,
             put_desired_frequency=put_fps
         )
         
@@ -105,19 +118,30 @@ class SingleRealSense(mp.Process):
             put_desired_frequency=put_fps
         )
 
-        # create shared array for intrinsics
+        # create shared array for intrinsics + depth_scale
+        # [0:4] = fx, fy, cx, cy
+        # [4:6] = height, width
+        # [6] = depth_scale
         intrinsics_array = SharedNDArray.create_from_shape(
             mem_mgr=shm_manager,
-            shape=(6,), 
+            shape=(7,),
             dtype=np.float64)
         intrinsics_array.get()[:] = 0
 
         # copied variables
         self.resolution = resolution
         self.put_fps = put_fps
-        self.num_downsample = num_downsample
         self.verbose = verbose
         self.put_start_time = None
+
+        # filter parameters
+        self.enable_threshold_filter = enable_threshold_filter
+        self.threshold_min_dist = threshold_min_dist
+        self.threshold_max_dist = threshold_max_dist
+        self.enable_spatial_filter = enable_spatial_filter
+        self.spatial_magnitude = spatial_magnitude
+        self.spatial_smooth_alpha = spatial_smooth_alpha
+        self.spatial_smooth_delta = spatial_smooth_delta
 
         # shared variables
         self.stop_event = mp.Event()
@@ -209,7 +233,7 @@ class SingleRealSense(mp.Process):
     def run(self):
         # limit threads
         threadpool_limits(1)
-        
+
         pipeline = rs.pipeline()
         cfg = rs.config()
         
@@ -220,14 +244,39 @@ class SingleRealSense(mp.Process):
         cfg.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
         profile = pipeline.start(cfg)
 
+        # Get depth sensor and depth_scale
+        depth_sensor = None
+        depth_scale = 0.001  # Default fallback
         try:
             depth_sensor = profile.get_device().first_depth_sensor()
+            depth_scale = depth_sensor.get_depth_scale()
+            if self.verbose:
+                cprint(f"[SingleRealSense] Depth scale: {depth_scale}", "cyan", attrs=["bold"])
             if depth_sensor.supports(rs.option.visual_preset):
-                depth_sensor.set_option(rs.option.visual_preset, 5.0)
-        except Exception:
+                depth_sensor.set_option(rs.option.visual_preset, 4.0)
+        except Exception as e:
             cprint(f"[SingleRealSense] visual_preset not supported: {e}", "yellow", attrs=["bold"])
             pass
-        
+
+        # Setup post-processing filters
+        threshold_filter = None
+        spatial_filter = None
+
+        if self.enable_threshold_filter:
+            threshold_filter = rs.threshold_filter()
+            threshold_filter.set_option(rs.option.min_distance, self.threshold_min_dist)
+            threshold_filter.set_option(rs.option.max_distance, self.threshold_max_dist)
+            if self.verbose:
+                cprint(f"[SingleRealSense] Threshold filter enabled: {self.threshold_min_dist}m ~ {self.threshold_max_dist}m", "cyan", attrs=["bold"])
+
+        if self.enable_spatial_filter:
+            spatial_filter = rs.spatial_filter()
+            spatial_filter.set_option(rs.option.filter_magnitude, self.spatial_magnitude)
+            spatial_filter.set_option(rs.option.filter_smooth_alpha, self.spatial_smooth_alpha)
+            spatial_filter.set_option(rs.option.filter_smooth_delta, self.spatial_smooth_delta)
+            if self.verbose:
+                cprint(f"[SingleRealSense] Spatial filter enabled: mag={self.spatial_magnitude}, alpha={self.spatial_smooth_alpha}, delta={self.spatial_smooth_delta}", "cyan", attrs=["bold"])
+
         # warmup
         for _ in range(30):
             pipeline.wait_for_frames()
@@ -247,6 +296,7 @@ class SingleRealSense(mp.Process):
             self.intrinsics_array.get()[3] = color_intr.ppy
             self.intrinsics_array.get()[4] = color_intr.height
             self.intrinsics_array.get()[5] = color_intr.width
+            self.intrinsics_array.get()[6] = depth_scale
 
             if self.verbose:
                 cprint(f"[SingleRealSense] Initialized with resolution {w}x{h} at {fps} FPS.", "green", attrs=["bold"])
@@ -259,58 +309,55 @@ class SingleRealSense(mp.Process):
             
             iter_idx = 0
 
-
             while not self.stop_event.is_set():
                 frames = pipeline.wait_for_frames(100)
                 if frames is None:
                     continue
-                
-                depth, color = frames.get_depth_frame(), frames.get_color_frame()
-                if not depth  or not color:
+
+                depth = frames.get_depth_frame()
+                color = frames.get_color_frame()
+                if not depth or not color:
                     continue
-                
+
+                # Apply SDK filters in order: Threshold → Spatial
+                # These filters are applied and SAVED to depth_image
+                if threshold_filter is not None:
+                    depth = threshold_filter.process(depth)
+
+                if spatial_filter is not None:
+                    depth = spatial_filter.process(depth)
+
+                # Get filtered depth array (after SDK filters)
+                depth_array_filtered = np.asanyarray(depth.get_data(), dtype=np.uint16)
+
                 if color:
                     rgb_array = np.frombuffer(color.get_data(), dtype=np.uint8).reshape((h, w, 3))
                 else:
                     rgb_array = np.zeros((h,w, 3), dtype=np.uint8)
-                
+
+                # Get intrinsics
+                instrinsics_data = self.intrinsics_array.get()[:4]  # [fx, fy, cx, cy]
+
                 receive_time = mono_time.now_s()
-                
-                pc.map_to(color)
-                points= pc.calculate(depth)
-                point_cloud = rs_points_to_array(points, color,
-                                        min_z=0.04, max_z=0.50, bilinear=True)
-                
-                num_valid_points = point_cloud.shape[0]
-                if num_valid_points > self.num_downsample:
-                    indices = np.random.choice(num_valid_points, self.num_downsample, replace=False)
-                    final_pc = point_cloud[indices]
-                elif num_valid_points < self.num_downsample:
-                    padding = np.zeros((self.num_downsample - num_valid_points, 6), dtype=np.float32)
-                    final_pc = np.vstack([point_cloud, padding])
-                else:
-                    final_pc = point_cloud
+
+                # Pointcloud generation removed - now using depth_image + OpenCV filters
+                # Keeping minimal pointcloud for backward compatibility
+                final_pc = np.zeros((1, 6), dtype=np.float32)
 
                 depth_time = depth.get_timestamp()
                 rgb_time = color.get_timestamp()
 
-                
                 if (depth_time - pre_time) > (1/self.put_fps)*1000+5:
                     anormaly_cnt+=1
                 pre_time=depth_time
-
-
-                if point_cloud is not None:
-                    final_pc = np.asarray(final_pc, dtype=np.float32)
-                    if len(final_pc.shape) == 1:
-                        final_pc = final_pc.reshape(-1, 6)
-                else:
-                    final_pc = np.zeros((self.num_downsample, 6), dtype=np.float32)
 
                 data = dict()
                 data['camera_receive_timestamp'] = receive_time
                 data['camera_capture_timestamp'] = depth_time
                 data['pointcloud']=final_pc
+                data['depth_image'] = depth_array_filtered  # Store SDK filtered depth (threshold + spatial)
+                data['color_image'] = rgb_array[:, :, ::-1]  # Store color image (BGR→RGB)
+                data['intrinsics'] = instrinsics_data  # Add intrinsics
 
                 data_ = dict()
                 data_['camera_receive_timestamp'] = receive_time
@@ -351,7 +398,3 @@ class SingleRealSense(mp.Process):
             cprint(f"[Realsense] anormaly_cnt: {anormaly_cnt}", "red", attrs=["bold"])
             if self.verbose:
                 cprint("[SingleRealSense] Main loop ended, resources cleaned up.", "red", attrs=["bold"])
-
-
-
-

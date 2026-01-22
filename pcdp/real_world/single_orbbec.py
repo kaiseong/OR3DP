@@ -54,6 +54,8 @@ class SingleOrbbec(mp.Process):
         examples['camera_receive_timestamp'] = 0.0
         examples['timestamp'] = 0.0
         examples['step_idx'] = 0
+        examples['intrinsics'] = np.empty(shape=(4,), dtype=np.float32)
+        examples['depth_image'] = np.empty(shape=(288, 320), dtype=np.uint16)
 
         ring_buffer = SharedMemoryRingBuffer.create_from_examples(
             shm_manager=shm_manager,
@@ -283,10 +285,18 @@ class SingleOrbbec(mp.Process):
                     points_data = np.empty((0, 6), dtype=np.float32)
 
 
+                # Get depth image data
+                depth_data = np.frombuffer(depth.get_data(), dtype=np.uint16).reshape((288, 320))
+
+                # Get intrinsics [fx, fy, cx, cy]
+                intrinsics_data = self.intrinsics_array.get()[:4].astype(np.float32)
+
                 data = dict()
                 data['camera_receive_timestamp'] = receive_time
                 data['camera_capture_timestamp'] = depth_time
-                data['pointcloud']=points_data
+                data['pointcloud'] = points_data
+                data['intrinsics'] = intrinsics_data
+                data['depth_image'] = depth_data
 
                 data_ = dict()
                 data_['camera_receive_timestamp'] = receive_time

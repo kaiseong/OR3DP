@@ -30,16 +30,9 @@ class BlendingProcessor:
         ee_to_d405: Optional[np.ndarray] = None,
         d405_depth_scale: Optional[float] = None,
         # Variance-based outlier filter parameters
-        enable_variance_filter: bool = False,
+        enable_variance_filter: bool = True,
         variance_kernel_size: int = 5,        # 5×5 윈도우
         variance_threshold: float = 50.0,   # 분산 임계값 (mm²)
-        # Composite filter parameters (Gradient + Density)
-        enable_composite_filter: bool = False,
-        composite_gradient_threshold: float = 80.0,  # mm (급경사 임계값)
-        composite_neighbor_kernel: int = 5,          # 이웃 확인 영역 (5x5)
-        composite_min_neighbors: int = 12,           # 최소 이웃 개수
-        composite_enable_erosion: bool = False,       # 침식 연산 활성화
-        composite_erosion_size: int = 3              # 침식 커널 크기
     ):
         """
         Args:
@@ -61,14 +54,6 @@ class BlendingProcessor:
         self.enable_variance_filter = enable_variance_filter
         self.variance_kernel_size = variance_kernel_size
         self.variance_threshold = variance_threshold
-
-        # Composite filter settings (Gradient + Density + Erosion)
-        self.enable_composite_filter = enable_composite_filter
-        self.composite_gradient_threshold = composite_gradient_threshold
-        self.composite_neighbor_kernel = composite_neighbor_kernel
-        self.composite_min_neighbors = composite_min_neighbors
-        self.composite_enable_erosion = composite_enable_erosion
-        self.composite_erosion_size = composite_erosion_size
 
         # Buffers
         self.femto_buffer = None
@@ -226,7 +211,7 @@ class BlendingProcessor:
         ee_pose: np.ndarray,
         femto_intrinsics: Tuple[float, float, float, float],
         femto_depth: np.ndarray,
-        return_debug: bool = False
+        return_labeled: bool = False,
     ):
         """
         Projection-based blending with KDTree spatial deduplication (vectorized, no for-loops!)
@@ -245,12 +230,15 @@ class BlendingProcessor:
             d405_pc: Mx6 [x,y,z,r,g,b] in D405 camera frame, m, RGB 0-1
                      (Already filtered by threshold filter in SingleRealSense)
             ee_pose: [x,y,z,rx,ry,rz] end-effector pose, m, radians
+            return_labeled: If True, return (N, 7) with label column (femto=0, d405=1)
 
         Returns:
-            blended_pc: Kx6 [x,y,z,r,g,b] in Femto camera frame, **mm** (output), RGB 0-1
+            if return_labeled=False (default):
+                blended_pc: Kx6 [x,y,z,r,g,b] in Femto camera frame, **mm**, RGB 0-1
+            if return_labeled=True:
+                labeled_pc: Kx7 [x,y,z,r,g,b,label] in Femto camera frame, **mm**, RGB 0-1
+                            label: 0=femto, 1=d405
         """
-        import time
-        t_start = time.perf_counter()
 
         # 1. d405 좌표를 femto bolt depth image에 투영
         # D405 점군을 Femto bolt depth 좌표계로 변환
@@ -276,7 +264,14 @@ class BlendingProcessor:
 
         # 만약 유효한 점이 하나도 없다면 Femto만 반환
         if len(xyz_valid) == 0:
-            return femto_pc[femto_pc[:, 2] > 0].astype(np.float32)
+            femto_valid = femto_pc[femto_pc[:, 2] > 0].astype(np.float32)
+            if return_labeled and len(femto_valid) > 0:
+                # Label column 추가: femto=0
+                femto_labels = np.zeros((len(femto_valid), 1), dtype=np.float32)
+                return np.hstack([femto_valid, femto_labels])
+            elif return_labeled:
+                return np.empty((0, 7), dtype=np.float32)
+            return femto_valid
 
         # 투영 공식 적용
         fx, fy, cx, cy = femto_intrinsics
@@ -304,94 +299,101 @@ class BlendingProcessor:
         occlusion_threshold = 50.0  # mm
         keep_mask = (z_f == 0) | (np.abs(z_d - z_f) > occlusion_threshold)
 
-        # 3. 결과 반환 (단위: mm 유지 - PointCloudPreprocessor가 mm→m 변환)
+        # 3. D405 점들 분류
         # 3-1. Femto 시야 내의 D405 점들 (blending logic 적용)
         d405_in_view_xyz = xyz_valid[in_image_mask][keep_mask]  # mm
         d405_in_view_rgb = rgb_valid[in_image_mask][keep_mask]
+        u_keep = u[in_image_mask][keep_mask]
+        v_keep = v[in_image_mask][keep_mask]
 
-        # 3-2. Femto 시야 밖의 D405 점들 (그대로 추가 - Femto가 볼 수 없는 영역)
+        # 3-2. Femto 시야 밖의 D405 점들 (depth image에 없음, 항상 포함)
         d405_out_view_xyz = xyz_valid[~in_image_mask]  # mm
         d405_out_view_rgb = rgb_valid[~in_image_mask]
 
-        # 합치기
-        d405_keep_xyz = np.vstack([d405_in_view_xyz, d405_out_view_xyz]) if len(d405_out_view_xyz) > 0 else d405_in_view_xyz
-        d405_keep_rgb = np.vstack([d405_in_view_rgb, d405_out_view_rgb]) if len(d405_out_view_rgb) > 0 else d405_in_view_rgb
+        # ========== 4. Combined Depth Image 생성 ==========
+        combined_depth = femto_depth.astype(np.float32).copy()
 
-        d405_result_pc = np.hstack([d405_keep_xyz, d405_keep_rgb])
+        # D405 in-view 점들의 depth를 fusion (min depth 선택)
+        if len(u_keep) > 0:
+            z_keep = d405_in_view_xyz[:, 2]
+            current_depth = combined_depth[v_keep, u_keep]
+            update_mask = (current_depth == 0) | (z_keep < current_depth)
+            combined_depth[v_keep[update_mask], u_keep[update_mask]] = z_keep[update_mask]
+
+        # ========== 5. Variance Filter (optional) ==========
+        if self.enable_variance_filter:
+            filtered_depth = self.apply_variance_filter(combined_depth)
+        else:
+            filtered_depth = combined_depth
+
+        # ========== 6. filtered_depth 기준 Point Cloud 필터링 ==========
+        # Femto points
         femto_valid_pc = femto_pc[femto_pc[:, 2] > 0]
-        # femto_valid_pc is already in mm
+        femto_xyz = femto_valid_pc[:, :3]
+        femto_u = (fx * femto_xyz[:, 0] / femto_xyz[:, 2] + cx).astype(np.int32)
+        femto_v = (fy * femto_xyz[:, 1] / femto_xyz[:, 2] + cy).astype(np.int32)
 
-        result = np.vstack([femto_valid_pc, d405_result_pc])
+        femto_in_bounds = (femto_u >= 0) & (femto_u < w) & (femto_v >= 0) & (femto_v < h)
+        femto_keep_mask = np.zeros(len(femto_valid_pc), dtype=bool)
+        femto_keep_mask[femto_in_bounds] = filtered_depth[femto_v[femto_in_bounds], femto_u[femto_in_bounds]] > 0
+        femto_filtered = femto_valid_pc[femto_keep_mask]
 
-        # Depth 기반 필터 적용 (Variance Filter 또는 Composite Filter)
-        # 둘 중 하나만 활성화되어야 함 
-        filter_enabled = self.enable_composite_filter or self.enable_variance_filter
-
-        if filter_enabled:
-            # Combined depth image 생성 (Femto + D405)
-            combined_depth = femto_depth.astype(np.float32).copy()
-
-            # D405 점들 중 keep된 점들의 depth를 combined_depth에 추가 (vectorized)
-            u_keep = u[in_image_mask][keep_mask]
-            v_keep = v[in_image_mask][keep_mask]
-            z_keep = d405_in_view_xyz[:, 2]  # mm (in-view 점들만)
-
-            # Vectorized depth fusion: min depth 선택 (가까운 물체 우선)
-            if len(u_keep) > 0:
-                # 현재 depth와 D405 depth 비교
-                current_depth = combined_depth[v_keep, u_keep]
-                # Femto가 0이거나 D405가 더 가까우면 D405 사용
-                update_mask = (current_depth == 0) | (z_keep < current_depth)
-                combined_depth[v_keep[update_mask], u_keep[update_mask]] = z_keep[update_mask]
-
-            # 필터 선택 (Composite 우선, 아니면 Variance)
-            if self.enable_composite_filter:
-                # Composite filter 적용 (Gradient + Neighbor Count + Erosion)
-                filtered_depth = self.apply_composite_filter(combined_depth)
-            else:
-                # Variance filter 적용 (OpenCV 가속, ~1ms)
-                filtered_depth = self.apply_variance_filter(combined_depth)
-
-            # 필터링된 depth image 기준으로 point cloud 재구성 (vectorized)
-            # Femto: 살아남은 픽셀만
-            femto_xyz = femto_valid_pc[:, :3]
-            femto_z = femto_xyz[:, 2]
-            femto_u = (fx * femto_xyz[:, 0] / femto_z + cx).astype(np.int32)
-            femto_v = (fy * femto_xyz[:, 1] / femto_z + cy).astype(np.int32)
-
-            # 이미지 경계 내 & filtered_depth > 0 체크 (vectorized)
-            femto_in_bounds = (femto_u >= 0) & (femto_u < w) & (femto_v >= 0) & (femto_v < h)
-            femto_keep_mask = np.zeros(len(femto_valid_pc), dtype=bool)
-            femto_keep_mask[femto_in_bounds] = filtered_depth[femto_v[femto_in_bounds], femto_u[femto_in_bounds]] > 0
-
-            # D405: 필터링된 depth에서 살아남은 in-view 점만 (out-of-view는 depth image에 없음)
-            d405_keep_mask_final = filtered_depth[v_keep, u_keep] > 0
+        # D405 in-view points (filtered_depth 기준)
+        if len(u_keep) > 0:
+            d405_in_keep_mask = filtered_depth[v_keep, u_keep] > 0
             d405_in_view_pc = np.hstack([d405_in_view_xyz, d405_in_view_rgb])
-            d405_filtered = d405_in_view_pc[d405_keep_mask_final]
+            d405_in_filtered = d405_in_view_pc[d405_in_keep_mask]
+        else:
+            d405_in_filtered = np.empty((0, 6), dtype=np.float32)
 
-            femto_filtered = femto_valid_pc[femto_keep_mask]
-            result = np.vstack([femto_filtered, d405_filtered]) if len(d405_filtered) > 0 else femto_filtered
+        # D405 out-of-view points (depth image 밖, 항상 포함)
+        if len(d405_out_view_xyz) > 0:
+            d405_out_view_pc = np.hstack([d405_out_view_xyz, d405_out_view_rgb])
+        else:
+            d405_out_view_pc = np.empty((0, 6), dtype=np.float32)
 
-        t_end = time.perf_counter()
-        blend_time_ms = (t_end - t_start) * 1000
-        # Verbose logging disabled - enable only for debugging
-        # print(f"[Blending] Time: {blend_time_ms:.1f}ms | Femto: {len(femto_valid_pc)} pts | D405 in: {len(d405_pc)} pts | D405 kept: {len(d405_result_pc)} pts | Total: {len(result)} pts")
+        # ========== 7. 결과 합치기 ==========
+        if return_labeled:
+            # Label column 추가: femto=0, d405=1
+            # femto_filtered: (N, 6) → (N, 7)
+            if len(femto_filtered) > 0:
+                femto_labels = np.zeros((len(femto_filtered), 1), dtype=np.float32)
+                femto_labeled = np.hstack([femto_filtered, femto_labels])
+            else:
+                femto_labeled = np.empty((0, 7), dtype=np.float32)
 
-        if return_debug:
-            debug_info = {
-                'n_femto_valid': len(femto_valid_pc),
-                'n_d405_input': len(d405_pc),
-                'n_d405_kept': len(d405_result_pc),
-                'n_before_filter': len(femto_valid_pc) + len(d405_result_pc),
-                'n_after_filter': len(result),
-                'filter_enabled': filter_enabled,
-                'variance_filter_enabled': self.enable_variance_filter,
-                'composite_filter_enabled': self.enable_composite_filter,
-                't_blend_ms': blend_time_ms,
-                't_variance_filter_ms': getattr(self, '_last_variance_filter_time_ms', 0.0),
-                't_composite_filter_ms': getattr(self, '_last_composite_filter_time_ms', 0.0)
-            }
-            return result.astype(np.float32), debug_info
+            # d405_in_filtered + d405_out_view_pc → (M, 7)
+            d405_parts = []
+            if len(d405_in_filtered) > 0:
+                d405_parts.append(d405_in_filtered)
+            if len(d405_out_view_pc) > 0:
+                d405_parts.append(d405_out_view_pc)
+
+            if d405_parts:
+                d405_combined = np.vstack(d405_parts)
+                d405_labels = np.ones((len(d405_combined), 1), dtype=np.float32)
+                d405_labeled = np.hstack([d405_combined, d405_labels])
+            else:
+                d405_labeled = np.empty((0, 7), dtype=np.float32)
+
+            # 합치기
+            parts = []
+            if len(femto_labeled) > 0:
+                parts.append(femto_labeled)
+            if len(d405_labeled) > 0:
+                parts.append(d405_labeled)
+
+            result = np.vstack(parts) if parts else np.empty((0, 7), dtype=np.float32)
+            return result.astype(np.float32)
+
+        # 기존 동작: label 없이 반환
+        parts = [femto_filtered]
+        if len(d405_in_filtered) > 0:
+            parts.append(d405_in_filtered)
+        if len(d405_out_view_pc) > 0:
+            parts.append(d405_out_view_pc)
+
+        result = np.vstack(parts) if len(parts) > 0 else np.empty((0, 6), dtype=np.float32)
 
         return result.astype(np.float32)
 
@@ -417,9 +419,6 @@ class BlendingProcessor:
         Returns:
             filtered_depth: (H, W) outlier 픽셀이 0으로 설정된 depth image
         """
-        import time
-        t_start = time.perf_counter()
-
         if kernel_size is None:
             kernel_size = self.variance_kernel_size
         if variance_threshold is None:
@@ -458,118 +457,6 @@ class BlendingProcessor:
 
         # 필터링된 depth 생성
         filtered_depth = np.where(keep_mask, depth_image, 0)
-
-        t_end = time.perf_counter()
-        self._last_variance_filter_time_ms = (t_end - t_start) * 1000
-
-        return filtered_depth.astype(depth_image.dtype)
-
-    def apply_composite_filter(
-        self,
-        depth_image: np.ndarray,
-        gradient_threshold: float = None,
-        neighbor_kernel_size: int = None,
-        min_neighbors: int = None,
-        enable_erosion: bool = None,
-        erosion_size: int = None
-    ) -> np.ndarray:
-        """
-        Composite filter: Gradient + Neighbor Count + Optional Erosion (OpenCV 가속).
-
-        Flying pixel 제거를 위한 복합 필터:
-        1. Gradient Filter: Sobel 연산으로 급격한 depth 변화 감지 → flying pixel 분리
-        2. Neighbor Count Filter: 2D 버전의 ROR, 유효 이웃 픽셀 수로 고립된 점 제거
-        3. Erosion (optional): 경계 노이즈 제거
-
-        원리:
-        - Flying pixel은 물체와 배경 사이에서 depth가 섞여 생기는 현상
-        - Gradient filter로 급격한 depth 변화를 감지하여 "잘라냄"
-        - 잘라낸 후 고립된 점들을 neighbor count로 제거
-        - Erosion으로 경계의 남은 노이즈 정리
-
-        Args:
-            depth_image: (H, W) depth image, mm 단위
-            gradient_threshold: Sobel gradient 임계값 (mm), None이면 self.composite_gradient_threshold 사용
-            neighbor_kernel_size: 이웃 확인 커널 크기, None이면 self.composite_neighbor_kernel 사용
-            min_neighbors: 최소 유효 이웃 개수, None이면 self.composite_min_neighbors 사용
-            enable_erosion: 침식 연산 활성화, None이면 self.composite_enable_erosion 사용
-            erosion_size: 침식 커널 크기, None이면 self.composite_erosion_size 사용
-
-        Returns:
-            filtered_depth: (H, W) outlier 픽셀이 0으로 설정된 depth image
-        """
-        import time
-        t_start = time.perf_counter()
-
-        # 파라미터 기본값 설정
-        if gradient_threshold is None:
-            gradient_threshold = self.composite_gradient_threshold
-        if neighbor_kernel_size is None:
-            neighbor_kernel_size = self.composite_neighbor_kernel
-        if min_neighbors is None:
-            min_neighbors = self.composite_min_neighbors
-        if enable_erosion is None:
-            enable_erosion = self.composite_enable_erosion
-        if erosion_size is None:
-            erosion_size = self.composite_erosion_size
-
-        # float32로 변환
-        depth = depth_image.astype(np.float32)
-        valid_mask = depth > 0
-
-        # ============================================
-        # Step 1: Gradient Filter (급격한 depth 변화 감지)
-        # ============================================
-        # Sobel operator로 x, y 방향 gradient 계산
-        # 0인 픽셀은 gradient 계산에서 제외하기 위해 마스킹
-        depth_masked = np.where(valid_mask, depth, 0)
-
-        grad_x = cv2.Sobel(depth_masked, cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(depth_masked, cv2.CV_32F, 0, 1, ksize=3)
-
-        # 제곱된 값으로 비교 (속도 최적화)
-        gradient_sq = grad_x**2 + grad_y**2
-        threshold_sq = gradient_threshold ** 2
-
-        # 급격한 gradient를 가진 픽셀 제거 (flying pixel 후보)
-        gradient_ok = gradient_sq < threshold_sq
-
-        # ============================================
-        # Step 2: Neighbor Count Filter 
-        # ============================================
-        # gradient filter 적용 후의 유효 마스크
-        valid_after_gradient = valid_mask & gradient_ok
-        valid_after_gradient_float = valid_after_gradient.astype(np.float32)
-
-        # 이웃 유효 픽셀 수 계산
-        ksize = (neighbor_kernel_size, neighbor_kernel_size)
-        neighbor_count = cv2.boxFilter(valid_after_gradient_float, -1, ksize, normalize=False)
-
-        # 자기 자신 제외 (중앙 픽셀)
-        neighbor_count = neighbor_count - valid_after_gradient_float
-
-        # 최소 이웃 개수 이상인 픽셀만 유지
-        neighbor_ok = neighbor_count >= min_neighbors
-
-        # ============================================
-        # Step 3: Erosion (optional, 경계 노이즈 제거)
-        # ============================================
-        keep_mask = valid_mask & gradient_ok & neighbor_ok
-
-        if enable_erosion and erosion_size > 1:
-            # 침식 연산으로 경계 픽셀 제거
-            erosion_kernel = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (erosion_size, erosion_size)
-            )
-            keep_mask_uint8 = keep_mask.astype(np.uint8)
-            keep_mask_eroded = cv2.erode(keep_mask_uint8, erosion_kernel)
-            keep_mask = keep_mask_eroded.astype(bool)
-
-        # 필터링된 depth 생성
-        filtered_depth = np.where(keep_mask, depth_image, 0)
-
-        t_end = time.perf_counter()
-        self._last_composite_filter_time_ms = (t_end - t_start) * 1000
 
         return filtered_depth.astype(depth_image.dtype)
 
@@ -741,25 +628,23 @@ class BlendingProcessor:
 
         return blended_pc
 
-    def process(self, verbose: bool = False):
+    def process(self, return_labeled: bool = False):
         """
         전체 파이프라인: 데이터 가져오기 → OpenCV 필터 적용 → Blending
 
         Args:
-            verbose: 디버그 정보 포함 여부
+            return_labeled: If True, blended_pc includes label column (femto=0, d405=1)
 
         Returns:
             dict: {
-                'femto_pc': (N, 6) array,
-                'd405_pc': (M, 6) array,
-                'blended_pc': (K, 6) array,
+                'femto_pc': (N, 6) array, raw Femto PC (camera frame, mm)
+                'd405_pc': (M, 6) array, raw D405 PC (camera frame, m)
+                'blended_pc': (K, 6) or (K, 7) array, blended PC (Femto frame, mm)
+                              if return_labeled=True: 7th column is label (0=femto, 1=d405)
                 'ee_pose': (6,) array,
                 'timestamps': dict,
-                'debug': dict (verbose=True일 때만)
             }
         """
-        import time
-
         # Lazy initialization: Get D405 depth scale on first call
         if self.d405_depth_scale is None:
             if not self.d405.is_ready:
@@ -768,76 +653,30 @@ class BlendingProcessor:
             print(f"[BlendingProcessor] D405 depth scale initialized: {self.d405_depth_scale}")
 
         # 1. 최신 데이터 가져오기 (Femto)
-        t_femto_start = time.perf_counter()
         data = self.get_latest_data()
-        t_femto_end = time.perf_counter()
 
         # 2. D405 depth_image → point cloud (SDK threshold + spatial filters already applied)
-        t_d405_start = time.perf_counter()
         d405_pc = self.depth_image_to_pointcloud(
             depth_image=data['d405_depth'],
             color_image=data['d405_color'],
             intrinsics=tuple(data['d405_intrinsics']),
             depth_scale=self.d405_depth_scale
         )
-        t_d405_end = time.perf_counter()
 
-        # 3. Apply voxel downsampling to D405 point cloud (4mm)
-        t_voxel_start = time.perf_counter()
-        # d405_pc_voxel = self.apply_voxel_filter(
-        #     point_cloud=d405_pc,
-        #     voxel_size=0.0015  # 4mm
-        # )
-        t_voxel_end = time.perf_counter()
+        # 3. Blending 수행
+        blended_pc = self.projection_blend(
+            data['femto_pc'],
+            d405_pc,
+            data['ee_pose'],
+            data['femto_intrinsics'],
+            data['femto_depth'],
+            return_labeled=return_labeled
+        )
 
-        # 4. Blending 수행
-        t_blend_start = time.perf_counter()
-        if verbose:
-            blended_pc, blend_debug = self.projection_blend(
-                data['femto_pc'],
-                d405_pc,
-                data['ee_pose'],
-                data['femto_intrinsics'],
-                data['femto_depth'],
-                return_debug=True
-            )
-        else:
-            blended_pc = self.projection_blend(
-                data['femto_pc'],
-                d405_pc,
-                data['ee_pose'],
-                data['femto_intrinsics'],
-                data['femto_depth']
-            )
-            blend_debug = {}
-        t_blend_end = time.perf_counter()
-
-        result = {
+        return {
             'femto_pc': data['femto_pc'],
-            'd405_pc': d405_pc,  # Voxel downsampled D405
+            'd405_pc': d405_pc,
             'blended_pc': blended_pc,
             'ee_pose': data['ee_pose'],
             'timestamps': data['timestamps']
         }
-
-        if verbose:
-            result['debug'] = {
-                # Point counts
-                'n_femto_raw': len(data['femto_pc']),
-                'n_d405_raw': len(d405_pc),
-                'n_d405_voxel': len(d405_pc),
-                'n_blended': blend_debug.get('n_before_filter', len(blended_pc)),  # 필터 전
-                'n_after_filter': blend_debug.get('n_after_filter', len(blended_pc)),  # 필터 후
-                # Timing (ms)
-                't_femto_ms': (t_femto_end - t_femto_start) * 1000,
-                't_d405_ms': (t_d405_end - t_d405_start) * 1000,
-                't_voxel_ms': (t_voxel_end - t_voxel_start) * 1000,
-                't_blend_ms': (t_blend_end - t_blend_start) * 1000,
-                't_variance_ms': blend_debug.get('t_variance_filter_ms', 0.0),
-                't_composite_ms': blend_debug.get('t_composite_filter_ms', 0.0),
-                # Flags
-                'variance_filter_enabled': self.enable_variance_filter,
-                'composite_filter_enabled': self.enable_composite_filter,
-            }
-
-        return result

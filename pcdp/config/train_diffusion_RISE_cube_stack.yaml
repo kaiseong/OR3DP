@@ -37,8 +37,8 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 120
-  num_workers: 24
+  batch_size: 60
+  num_workers: 15
   shuffle: True
   drop_last: True
 
