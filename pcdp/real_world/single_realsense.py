@@ -1,5 +1,6 @@
 # single_orbbec.py
 import numpy as np
+import cv2
 import multiprocessing as mp
 from threadpoolctl import threadpool_limits
 from multiprocessing.managers import SharedMemoryManager
@@ -67,16 +68,16 @@ class SingleRealSense(mp.Process):
         put_fps=60,
         get_max_k=60,
         verbose=False,
-        # Depth filter parameters (applied during data collection)
-        # Threshold + Spatial filters are applied and SAVED to depth_image
-        # Voxel downsampling is applied later during training/inference
         enable_threshold_filter=True,
         threshold_min_dist=0.04,  # meter
-        threshold_max_dist=0.20,  # meter
+        threshold_max_dist=0.25,  # meter
         enable_spatial_filter=True,
         spatial_magnitude=2,      # 반복 횟수 (1~5)
         spatial_smooth_alpha=0.7, # 필터 강도 (0.25~1.0)
-        spatial_smooth_delta=15   # Edge 감지 임계값 (1~50)
+        spatial_smooth_delta=15,   # Edge 감지 임계값 (1~50)
+        enable_variance_filter=True,
+        variance_kernel_size=5,
+        variance_threshold=50.0
     ):
         super().__init__()
 
@@ -142,6 +143,9 @@ class SingleRealSense(mp.Process):
         self.spatial_magnitude = spatial_magnitude
         self.spatial_smooth_alpha = spatial_smooth_alpha
         self.spatial_smooth_delta = spatial_smooth_delta
+        self.enable_variance_filter = enable_variance_filter
+        self.variance_kernel_size = variance_kernel_size
+        self.variance_threshold = variance_threshold
 
         # shared variables
         self.stop_event = mp.Event()
@@ -229,6 +233,64 @@ class SingleRealSense(mp.Process):
         scale = self.intrinsics_array.get()[-1]
         return scale
     
+    @staticmethod
+    def apply_variance_filter(
+        depth_image: np.ndarray,
+        kernel_size: int = 5,
+        variance_threshold: float = 50.0
+    ) -> np.ndarray:
+        """
+        Depth image에 분산 기반 outlier 필터 적용
+
+        원리:
+        - 각 픽셀의 주변 kernel 영역의 depth 분산 계산
+        - 분산이 threshold보다 크면 해당 픽셀은 outlier로 판단
+        - Var = E[X²] - E[X]²
+
+        Args:
+            depth_image: (H, W) depth image, mm 단위
+            kernel_size: 윈도우 크기 (홀수), 기본값 5
+            variance_threshold: 분산 임계값 (mm²), 기본값 50.0
+
+        Returns:
+            filtered_depth: (H, W) outlier 픽셀이 0으로 설정된 depth image
+        """
+        # float32로 변환 (정밀도 및 연산 속도)
+        depth = depth_image.astype(np.float32)
+
+        # 유효하지 않은 depth(0)를 처리
+        valid_mask = depth > 0
+        depth_zero_filled = np.where(valid_mask, depth, 0)
+
+        # cv2.boxFilter로 local sum 계산 (normalize=False)
+        ksize = (kernel_size, kernel_size)
+
+        # 합계 계산
+        depth_sum = cv2.boxFilter(depth_zero_filled, -1, ksize, normalize=False)
+        valid_count = cv2.boxFilter(valid_mask.astype(np.float32), -1, ksize, normalize=False)
+
+        # 0으로 나누기 방지 (분산 계산용)
+        valid_count_safe = np.maximum(valid_count, 1)
+
+        # E[X] = local mean
+        mean = depth_sum / valid_count_safe
+
+        # E[X²] = local mean of squared values
+        depth_sq = depth_zero_filled ** 2
+        depth_sq_sum = cv2.boxFilter(depth_sq, -1, ksize, normalize=False)
+        sq_mean = depth_sq_sum / valid_count_safe
+
+        # Var = E[X²] - E[X]²
+        variance = sq_mean - mean ** 2
+
+        # 분산이 threshold 이하이고 depth가 유효한 픽셀만 유지
+        keep_mask = (variance < variance_threshold) & valid_mask
+
+        # 필터링된 depth 생성
+        filtered_depth = np.where(keep_mask, depth_image, 0)
+
+        return filtered_depth.astype(depth_image.dtype)
+
     # ========= internal API ===========
     def run(self):
         # limit threads
@@ -327,8 +389,19 @@ class SingleRealSense(mp.Process):
                 if spatial_filter is not None:
                     depth = spatial_filter.process(depth)
 
+                # Get timestamp before converting to numpy
+                depth_time = depth.get_timestamp()
+
                 # Get filtered depth array (after SDK filters)
                 depth_array_filtered = np.asanyarray(depth.get_data(), dtype=np.uint16)
+
+                # Apply variance filter on numpy array
+                if self.enable_variance_filter:
+                    depth_array_filtered = SingleRealSense.apply_variance_filter(
+                        depth_array_filtered,
+                        self.variance_kernel_size,
+                        self.variance_threshold
+                    )
 
                 if color:
                     rgb_array = np.frombuffer(color.get_data(), dtype=np.uint8).reshape((h, w, 3))
@@ -344,7 +417,6 @@ class SingleRealSense(mp.Process):
                 # Keeping minimal pointcloud for backward compatibility
                 final_pc = np.zeros((1, 6), dtype=np.float32)
 
-                depth_time = depth.get_timestamp()
                 rgb_time = color.get_timestamp()
 
                 if (depth_time - pre_time) > (1/self.put_fps)*1000+5:
@@ -363,7 +435,6 @@ class SingleRealSense(mp.Process):
                 data_['camera_receive_timestamp'] = receive_time
                 data_['camera_capture_timestamp'] = rgb_time
                 data_['image'] = rgb_array[:, :, ::-1] # BGR->RGB
-
 
                 put_data = data
                 put_data_ = data_

@@ -72,11 +72,17 @@ class PointCloudPreprocessor:
                 extrinsics_matrix=None,
                 enable_cropping=True,
                 workspace_bounds=None,
+                enable_wrist_camera = True,
+                # Variance filter
                 enable_filter=False,
+                variance_kernel_size=5,
+                variance_threshold=50,
+                # Open3D Outlier filter (legacy)
                 nb_points=10,
                 sor_std=1.7,
                 use_cuda=True,
                 verbose=False,
+                # PCM parameters
                 enable_temporal=False,
                 export_mode='off',
                 temporal_voxel_size=0.005,
@@ -147,7 +153,11 @@ class PointCloudPreprocessor:
         self.enable_transform = enable_transform
         self.enable_cropping = enable_cropping
         self.enable_sampling = enable_sampling
+        self.enable_wrist_camera = enable_wrist_camera
         self.enable_filter = enable_filter
+        self.variance_kernel_size = variance_kernel_size
+        self.variance_threshold = variance_threshold
+
         self.use_cuda = bool(use_cuda and torch.cuda.is_available())
         self.verbose = verbose
         
@@ -171,12 +181,12 @@ class PointCloudPreprocessor:
         self._miss_min_age = int(miss_min_age)
 
         self._base_to_cam = None
-        if self.enable_occlusion_prune:
+        if self.enable_occlusion_prune or self.enable_filter:
             if self.extrinsics_matrix is None:
-                raise ValueError("enable_occlusion_prune=True인데 extrinsics_matrix가 없습니다.")
+                raise ValueError("enable_occlusion_prune=True 또는 enable_filter=True인데 extrinsics_matrix가 없습니다.")
             self._base_to_cam = np.linalg.inv(np.array(self.extrinsics_matrix, dtype=np.float64))
             if self._K_depth is None or self._depth_w is None or self._depth_h is None:
-                raise ValueError("occlusion prune에는 depth_width/height와 K_depth가 필요합니다.")
+                raise ValueError("occlusion prune/variance filter에는 depth_width/height와 K_depth가 필요합니다.")
 
         self._frame_idx = 0
         self._mem_keys = np.empty((0,), dtype=np.dtype((np.void, 12)))
@@ -203,10 +213,10 @@ class PointCloudPreprocessor:
             print(f"  - Sampling: {self.enable_sampling} (target: {self.target_num_points})")
             print(f"  - CUDA: {self.use_cuda}")
         
-        if (self.enable_temporal and self.export_mode == 'fused') or self.enable_occlusion_prune:
+        if (self.enable_temporal and self.export_mode == 'fused') or self.enable_occlusion_prune or self.enable_filter:
             if not self.use_cuda:
                 raise RuntimeError(
-                    "GPU-only path enabled (temporal fused / occlusion prune). "
+                    "GPU-only path enabled (temporal fused / occlusion prune / variance filter). "
                     "Set use_cuda=True and ensure CUDA is available."
                 )
             self._maybe_init_torch_camera()
@@ -588,24 +598,33 @@ class PointCloudPreprocessor:
             self._delete_mask(keep_global)
 
 
-    def process(self, points):
+    def process(self, points, w_points=None):
         if points is None or len(points) == 0:
             if self.enable_temporal and self.export_mode == 'fused':
                 self._frame_idx += 1
-                return np.zeros((0,7), dtype=np.float32)
-            return np.zeros((self.target_num_points, 6), dtype=np.float32)
-            
+                return np.zeros((0,7), dtype=np.float32), None
+            return np.zeros((self.target_num_points, 6), dtype=np.float32), None
+
         points = points.astype(np.float32)
+        if self.enable_wrist_camera and w_points is not None:
+            w_points = w_points.astype(np.float32)
+
+            if self.enable_transform:
+                w_points = self._apply_transform(w_points)
+        else:
+            w_points = None
+
         if self.enable_transform:
             points = self._apply_transform(points)
         if self.enable_cropping:
             points = self._crop_workspace(points)
         if self.enable_filter:
-            points = self._apply_filter(points)
+            # points = self._apply_filter(points)
+            points = self._apply_variance_filter(points)
         if not self.enable_temporal or self.export_mode!="fused":
             if self.enable_sampling:
                 points = self._sample_points(points)
-            return points
+            return points, w_points
         
 
         now_step = self._frame_idx
@@ -624,10 +643,10 @@ class PointCloudPreprocessor:
         self._prune_mem(now_step)
 
         out = self._export_array_from_mem(now_step)
-        
-        
+
+
         self._frame_idx += 1
-        return out
+        return out, w_points
 
 
     def _apply_transform(self, points):
@@ -675,6 +694,54 @@ class PointCloudPreprocessor:
         _, ind = pcd.remove_radius_outlier(nb_points=12, radius=0.01)
         return points[ind]
 
+    def _apply_variance_filter(self, points):
+        if len(points) == 0:
+            raise ValueError("points empty")
+
+        xyz = points[:, :3]
+        u, v, z, idx = self._project_base_to_cam_torch(xyz)
+
+        # No valid projections
+        if len(u) == 0:
+            return points
+
+        Z = self._rasterize_min_float_torch(u, v, z, self._depth_h, self._depth_w)
+        kernel_size = self.variance_kernel_size
+        # Convert variance_threshold from mm^2 to m^2 (Z is in meters)
+        variance_threshold = self.variance_threshold * 1e-6
+
+        valid_mask = Z > 0
+        depth_zero_filled = np.where(valid_mask, Z, 0)
+
+        ksize = (kernel_size, kernel_size)
+
+        depth_sum = cv2.boxFilter(depth_zero_filled, -1, ksize, normalize=False)
+        valid_count = cv2.boxFilter(valid_mask.astype(np.float32), -1, ksize, normalize=False)
+
+        valid_count_safe = np.maximum(valid_count, 1)
+
+        mean = depth_sum / valid_count_safe
+
+        depth_sq = depth_zero_filled ** 2
+        depth_sq_sum = cv2.boxFilter(depth_sq, -1, ksize, normalize=False)
+        sq_mean = depth_sq_sum / valid_count_safe
+
+        variance = sq_mean - mean ** 2
+
+        # Create keep mask based on variance threshold
+        keep_mask_2d = (variance < variance_threshold) & valid_mask
+
+        # Map projected points back to original indices
+        u_idx = np.clip(np.round(u).astype(int), 0, self._depth_w - 1)
+        v_idx = np.clip(np.round(v).astype(int), 0, self._depth_h - 1)
+
+        # Check which projected points pass the variance filter
+        projected_keep = keep_mask_2d[v_idx, u_idx] & (np.abs(z - Z[v_idx, u_idx]) < 1e-3)
+
+        # Get original indices of points to keep
+        kept_original_indices = idx[projected_keep]
+
+        return points[kept_original_indices]     
 
 
 

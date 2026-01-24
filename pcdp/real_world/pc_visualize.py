@@ -79,9 +79,9 @@ def main(
     enable_crop=True,
     enable_ror=False,
     # PCM flags (각 카메라별)
-    enable_pcm_femto=True,
+    enable_pcm_femto=False,
     enable_pcm_d405=False,  # 추후 구현
-    enable_teleop=True,
+    enable_teleop=False,
 ):
     """
     Args:

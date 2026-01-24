@@ -291,13 +291,12 @@ class BlendingProcessor:
         z_f = femto_depth[v_valid, u_valid].astype(np.float32)
 
 
-        # 2. blending logic 수행
-        # Keep D405 points if:
-        # 1. Femto has no depth (z_f == 0) - D405 sees areas Femto cannot
-        # 2. D405 depth significantly differs from Femto (occlusion case)
-        #    - D405 is wrist-mounted and can see behind robot arm
-        occlusion_threshold = 50.0  # mm
-        keep_mask = (z_f == 0) | (np.abs(z_d - z_f) > occlusion_threshold)
+        # 2. Blending logic (Blacklist 방식)
+        # Femto가 메인 카메라 → 둘 다 같은 표면 보면 Femto 우선
+        # D405 삭제 조건: Femto가 보고 있고 + 깊이가 유사 (같은 표면)
+        similarity_threshold = 15.0  # mm - 이 이내면 같은 표면으로 간주
+        delete_mask = (z_f > 0) & (np.abs(z_d - z_f) < similarity_threshold)
+        keep_mask = ~delete_mask
 
         # 3. D405 점들 분류
         # 3-1. Femto 시야 내의 D405 점들 (blending logic 적용)
@@ -306,7 +305,7 @@ class BlendingProcessor:
         u_keep = u[in_image_mask][keep_mask]
         v_keep = v[in_image_mask][keep_mask]
 
-        # 3-2. Femto 시야 밖의 D405 점들 (depth image에 없음, 항상 포함)
+        # 3-2. Femto 시야 밖의 D405 점들 (depth image 범위 밖, 항상 포함)
         d405_out_view_xyz = xyz_valid[~in_image_mask]  # mm
         d405_out_view_rgb = rgb_valid[~in_image_mask]
 
@@ -338,11 +337,9 @@ class BlendingProcessor:
         femto_keep_mask[femto_in_bounds] = filtered_depth[femto_v[femto_in_bounds], femto_u[femto_in_bounds]] > 0
         femto_filtered = femto_valid_pc[femto_keep_mask]
 
-        # D405 in-view points (filtered_depth 기준)
-        if len(u_keep) > 0:
-            d405_in_keep_mask = filtered_depth[v_keep, u_keep] > 0
-            d405_in_view_pc = np.hstack([d405_in_view_xyz, d405_in_view_rgb])
-            d405_in_filtered = d405_in_view_pc[d405_in_keep_mask]
+        # D405 in-view points (filtered_depth 필터 제거 - keep_mask만으로 충분)
+        if len(d405_in_view_xyz) > 0:
+            d405_in_filtered = np.hstack([d405_in_view_xyz, d405_in_view_rgb])
         else:
             d405_in_filtered = np.empty((0, 6), dtype=np.float32)
 
