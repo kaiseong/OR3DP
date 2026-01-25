@@ -7,6 +7,7 @@ import time
 from pcdp.real_world.real_data_pc_conversion import PointCloudPreprocessor
 from pcdp.real_world.single_realsense import SingleRealSense
 from pcdp.common.replay_buffer import ReplayBuffer
+from pcdp.common.RISE_transformation import rot_trans_mat
 
 path_dataset = '/home/moai/OR3DP/data/cube_stack/recorder_data'
 
@@ -137,50 +138,16 @@ def depth_to_pointcloud(depth_image, color_image, intrinsics, depth_scale=0.0001
     return points
 
 
-def transform_pointcloud(points, transform_matrix):
+def get_d405_dynamic_extrinsics(robot_eef_pose):
     """
-    Apply 4x4 transformation matrix to point cloud.
-
-    Args:
-        points: (N, 6) array [x, y, z, r, g, b]
-        transform_matrix: (4, 4) transformation matrix
-
-    Returns:
-        transformed_points: (N, 6) array
-    """
-    if len(points) == 0:
-        return points
-
-    xyz = points[:, :3]
-    rgb = points[:, 3:6]
-
-    # Homogeneous coordinates
-    ones = np.ones((xyz.shape[0], 1), dtype=xyz.dtype)
-    xyz_h = np.concatenate([xyz, ones], axis=1)  # (N, 4)
-
-    # Transform
-    xyz_transformed = (xyz_h @ transform_matrix.T)[:, :3]
-
-    # Combine back
-    transformed_points = np.concatenate([xyz_transformed, rgb], axis=1)
-
-    return transformed_points
-
-
-def get_robot_to_d405_transform(robot_eef_pose, ee_to_d405, robot_to_base):
-    """
-    Compute D405 camera to base frame transformation.
+    Compute D405 camera to base frame transformation (dynamic extrinsics).
 
     Args:
         robot_eef_pose: (6,) [x, y, z, rx, ry, rz] end-effector pose in meters and radians
-        ee_to_d405: (4, 4) end-effector to D405 camera transform
-        robot_to_base: (4, 4) robot base to world base transform
 
     Returns:
         d405_to_base: (4, 4) D405 camera to base frame transform
     """
-    from pcdp.common.RISE_transformation import rot_trans_mat
-
     # EE pose to transformation matrix
     manipulator_to_ee = rot_trans_mat(robot_eef_pose[:3], robot_eef_pose[3:6])
 
@@ -268,12 +235,24 @@ class DatasetVisualizer:
             extrinsics_matrix=femto_cam_to_base,
             enable_cropping=enable_femto_cropping,
             workspace_bounds=self.workspace_bounds,
-            enable_wrist_camera=False,  # We handle D405 separately
+            enable_wrist_camera=False,
             enable_filter=enable_femto_variance_filter,
             variance_kernel_size=femto_variance_kernel_size,
             variance_threshold=femto_variance_threshold,
             enable_temporal=False,
         )
+
+        # Initialize preprocessor for D405 wrist camera
+        if self.enable_wrist_camera:
+            self.wrist_preprocessor = PointCloudPreprocessor(
+                enable_sampling=False,
+                enable_transform=enable_d405_transform,
+                extrinsics_matrix=None,  # Dynamic extrinsics - passed per frame
+                enable_cropping=False,   # No workspace cropping for wrist
+                enable_wrist_camera=False,
+                enable_filter=False,     # Variance filter applied on depth image
+                enable_temporal=False,
+            )
 
     def _load_episode_data(self):
         """Load episode data from zarr."""
@@ -301,7 +280,7 @@ class DatasetVisualizer:
     def _process_femto_frame(self, frame_idx):
         """Process Femto Bolt point cloud for a frame."""
         raw_pc = self.femto_pointclouds[frame_idx]
-        processed_pc, _ = self.femto_preprocessor.process(raw_pc, None)
+        processed_pc = self.femto_preprocessor.process(raw_pc)
         return processed_pc
 
     def _process_d405_frame(self, frame_idx):
@@ -314,7 +293,7 @@ class DatasetVisualizer:
         intrinsics = self.d405_intrinsics[frame_idx]
         robot_pose = self.robot_eef_poses[frame_idx]
 
-        # Apply variance filter to depth image
+        # Apply variance filter to depth image (before point cloud conversion)
         if self.enable_d405_variance_filter:
             depth_image = SingleRealSense.apply_variance_filter(
                 depth_image,
@@ -328,10 +307,10 @@ class DatasetVisualizer:
         if len(d405_pc) == 0:
             return np.zeros((0, 6), dtype=np.float32)
 
-        # Transform to base frame
+        # Transform to base frame using process_wrist with dynamic extrinsics
         if self.enable_d405_transform:
-            d405_to_base = get_robot_to_d405_transform(robot_pose, ee_to_d405, robot_to_base)
-            d405_pc = transform_pointcloud(d405_pc, d405_to_base)
+            dynamic_extrinsics = get_d405_dynamic_extrinsics(robot_pose)
+            d405_pc = self.wrist_preprocessor.process_wrist(d405_pc, dynamic_extrinsics)
 
         return d405_pc
 

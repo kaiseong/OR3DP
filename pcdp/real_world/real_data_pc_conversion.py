@@ -598,34 +598,25 @@ class PointCloudPreprocessor:
             self._delete_mask(keep_global)
 
 
-    def process(self, points, w_points=None):
+    def process(self, points):
         if points is None or len(points) == 0:
             if self.enable_temporal and self.export_mode == 'fused':
                 self._frame_idx += 1
-                return np.zeros((0,7), dtype=np.float32), None
-            return np.zeros((self.target_num_points, 6), dtype=np.float32), None
+                return np.zeros((0, 7), dtype=np.float32)
+            return np.zeros((self.target_num_points, 6), dtype=np.float32)
 
         points = points.astype(np.float32)
-        if self.enable_wrist_camera and w_points is not None:
-            w_points = w_points.astype(np.float32)
-
-            if self.enable_transform:
-                w_points = self._apply_transform(w_points)
-        else:
-            w_points = None
 
         if self.enable_transform:
             points = self._apply_transform(points)
         if self.enable_cropping:
             points = self._crop_workspace(points)
         if self.enable_filter:
-            # points = self._apply_filter(points)
             points = self._apply_variance_filter(points)
-        if not self.enable_temporal or self.export_mode!="fused":
+        if not self.enable_temporal or self.export_mode != "fused":
             if self.enable_sampling:
                 points = self._sample_points(points)
-            return points, w_points
-        
+            return points
 
         now_step = self._frame_idx
 
@@ -634,20 +625,28 @@ class PointCloudPreprocessor:
 
         if self.enable_occlusion_prune:
             self._occlusion_prune_memory_fast(points[:, :3])
-        
+
         assert self.use_cuda, "GPU-only path: fused temporal export requires CUDA"
         xyz_now, rgb_now, keys_new = self._frame_unique_torch(xyz_now, rgb_now)
         self._merge_into_mem(xyz_now, rgb_now, now_step, keys_new=keys_new)
-
 
         self._prune_mem(now_step)
 
         out = self._export_array_from_mem(now_step)
 
-
         self._frame_idx += 1
-        return out, w_points
+        return out
+    
+    def process_wrist(self, points, dynamic_extrinsics=None):
+        if points is None or len(points) == 0:
+            return np.zeros((0, 6), dtype=np.float32)
 
+        points = points.astype(np.float32)
+
+        if self.enable_transform and dynamic_extrinsics is not None:
+            points = self._apply_dynamic_transform(points, dynamic_extrinsics)
+
+        return points
 
     def _apply_transform(self, points):
 
@@ -664,7 +663,24 @@ class PointCloudPreprocessor:
                   f"XYZ range: [{points[:, :3].min(axis=0)} - {points[:, :3].max(axis=0)}]")
         
         return points
-        
+    
+    def _apply_dynamic_transform(self, points, dynamic_extrinsics):
+        if len(points) == 0:
+            return points
+
+        points = points[points[:, 2] > 0.0]
+        if len(points) == 0:
+            return points
+
+        point_xyz = points[:, :3]
+
+        point_homogeneous = np.hstack((point_xyz, np.ones((point_xyz.shape[0], 1))))
+        point_transformed = np.dot(point_homogeneous, dynamic_extrinsics.T)
+
+        points[:, :3] = point_transformed[:, :3]
+
+        return points
+
     def _crop_workspace(self, points):
         if len(points) == 0:
             return points
