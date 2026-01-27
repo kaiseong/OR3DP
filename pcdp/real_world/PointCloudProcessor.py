@@ -1,44 +1,10 @@
-# real_data_pc_conversion.py
-
-
-
-from typing import Sequence, Tuple, Dict, Optional, Union, List
-import os
-import pathlib
-import cv2
-import numpy as np
-import zarr
-import numcodecs
-from tqdm import tqdm
-import open3d as o3d
-import torch
-import pcdp.common.mono_time as mono_time
-try:
-    import pytorch3d.ops as torch3d_ops
-    PYTORCH3D_AVAILABLE = True
-except ImportError:
-    PYTORCH3D_AVAILABLE = False
-    print("Warning: pytorch3d not available. FPS will use fallback method.")
-
-
-from pcdp.common import RISE_transformation as rise_tf
-from pcdp.common.replay_buffer import ReplayBuffer, get_optimal_chunks
-from pcdp.common.RISE_transformation import xyz_rot_transform
-
-robot_to_base = np.array([
-    [1., 0., 0., -0.04],
-    [0., 1., 0., -0.29],
-    [0., 0., 1., -0.03],
-    [0., 0., 0.,  1.0]
-])
-
 class PointCloudPreprocessor:
     """
     - 기존 단일뷰 PCM(temporal fused) + occlusion prune + variance filter 유지
     - 멀티뷰(Femto + D405)용 process_global / _occlusion_prune_memory_multiview 추가
     - depth_u16를 그대로 Z-buffer로 사용(빠름): uint16 erosion(min-filter)로 Zmin 생성
     - "공격적 삭제"는 free-space carving 기준으로 margin=0이 가장 공격적:
-        delete_free_space: z_mem < (z_now + margin)
+        delete_free_space: z_mem < (z_now - margin)
       (margin>0이면 덜 공격적 / noise 허용)
     """
 
@@ -86,23 +52,6 @@ class PointCloudPreprocessor:
         if z_unit in ("0.1mm", "0_1mm", "1e-4"):
             return d * 1e-4
         raise ValueError(f"Unknown z_unit={z_unit}")
-    
-    @staticmethod
-    def _gather_zbuf_np(zbuf_m: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        """
-        zbuf_m: (H,W) float32 meters, invalid=0
-        u,v: (N,) int32 pixel coords
-        return z_now: (N,) float32 meters (0 if out-of-bounds or invalid)
-        """
-        z_now = np.zeros((u.shape[0],), dtype=np.float32)
-        if u.size == 0:
-            return z_now
-
-        H, W = zbuf_m.shape[:2]
-        inb = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-        if np.any(inb):
-            z_now[inb] = zbuf_m[v[inb], u[inb]]
-        return z_now
 
     # ----------------------------
     # ctor
@@ -147,7 +96,7 @@ class PointCloudPreprocessor:
         miss_prune_frames: int = 20,
         miss_min_age: int = 2,
         # free-space delete margin (meters)
-        free_space_margin_m: float = 0.009,      # ✅ 공격적으로: 0.0  (값↑ => 덜 삭제)
+        free_space_margin_m: float = 0.0,      # ✅ 공격적으로: 0.0  (값↑ => 덜 삭제)
     ):
         # extrinsics (Femto cam_to_base or similar) default
         if extrinsics_matrix is None:
@@ -676,7 +625,7 @@ class PointCloudPreprocessor:
         z_now_at = Z_min[v_m, u_m].astype(np.float32, copy=False)
 
         # delete free-space (aggressive when margin=0)
-        thr = z_now_at + float(self._free_space_margin_m)
+        thr = z_now_at - float(self._free_space_margin_m)
         del_local_valid = (z_now_at > 0.0) & (z_m < thr)
 
         del_local_mask = np.zeros_like(valid_mem, dtype=bool)
@@ -777,141 +726,83 @@ class PointCloudPreprocessor:
 
     def _occlusion_prune_memory_multiview(
         self,
-        mem_xyz_base,
-        femto_depth_u16,
-        femto_z_unit: str,
-        d405_depth_u16=None,
-        d405_z_unit: str = "mm",
-        d405_cam_to_base=None,
-        K_d405=None,
-        d405_wh=None,
+        *,
+        Z_f: Optional[np.ndarray],        # (Hf,Wf) meters
+        Z_d: Optional[np.ndarray],        # (Hd,Wd) meters
+        base_to_cam_d: np.ndarray,        # D405 base->cam (매 프레임 갱신)
+        K_d: np.ndarray,
+        W_d: int,
+        H_d: int,
     ):
         """
-        멀티뷰 free-space carving (memory prune).
-
-        핵심 변경점 (Femto):
-          - mem_xyz를 매 프레임 _project_base_to_cam_torch()로 재투영하지 않고,
-            이미 메모리에 캐시된 self._mem_u, self._mem_v, self._mem_zcam을 재사용.
-
-        반환값(기존 호환):
-          - delete_mask: (Nm,) bool
-            True면 메모리에서 삭제할 포인트.
-          *주의*: 기존 코드가 (delete_mask, hit_mask) 형태를 반환하던 구조라면,
-            아래 하단의 "HIT MASK" 섹션을 켜고 process_global 쪽도 맞춰야 합니다.
+        miss 업데이트: hit_any = hit_f OR hit_d
+        free-space delete(공격적): z_mem < (z_now - margin)
         """
-        # ---- normalize inputs ----
-        if isinstance(mem_xyz_base, torch.Tensor):
-            mem_xyz_base = mem_xyz_base.detach().cpu().numpy()
-        mem_xyz_base = np.asarray(mem_xyz_base, dtype=np.float32)
-        Nm = int(mem_xyz_base.shape[0])
-        if Nm == 0:
-            return np.zeros((0,), dtype=bool)
+        assert self.use_cuda
+        if self._mem_keys.size == 0:
+            return
 
-        delete_mask = np.zeros((Nm,), dtype=bool)
+        N = self._mem_xyz.shape[0]
+        margin = float(self._free_space_margin_m)
 
-        # thresholds
-        free_margin = float(getattr(self, "_free_space_margin_m", 0.09))
+        # ---------- Femto hit / delete ----------
+        hit_f = np.zeros((N,), dtype=bool)
+        del_f = np.zeros((N,), dtype=bool)
 
-        # ============================================================
-        # (1) Femto view pruning
-        # ============================================================
-        if femto_depth_u16 is not None:
-            # depth -> z-buffer (meters)
-            zbuf_f = self._zmin_from_depth_u16(femto_depth_u16, z_unit=femto_z_unit)
-            if isinstance(zbuf_f, torch.Tensor):
-                zbuf_f = zbuf_f.detach().cpu().numpy()
-            zbuf_f = np.asarray(zbuf_f, dtype=np.float32)
+        if Z_f is not None and Z_f.size > 0 and self.enable_occlusion_prune:
+            if Z_f.shape != (self._depth_h, self._depth_w):
+                # shape mismatch면 조용히 skip 대신, 디버깅에 유리하게 에러
+                raise ValueError(f"Z_f shape must be ({self._depth_h},{self._depth_w}), got {Z_f.shape}")
 
-            use_cache = (
-                hasattr(self, "_mem_u") and hasattr(self, "_mem_v") and hasattr(self, "_mem_zcam")
-                and (self._mem_u is not None) and (self._mem_v is not None) and (self._mem_zcam is not None)
-                and (len(self._mem_u) == Nm) and (len(self._mem_v) == Nm) and (len(self._mem_zcam) == Nm)
+            valid_f = (self._mem_u >= 0) & (self._mem_v >= 0) & (self._mem_zcam > 0.0)
+            if np.any(valid_f):
+                u = self._mem_u[valid_f]
+                v = self._mem_v[valid_f]
+                z_m = self._mem_zcam[valid_f].astype(np.float32, copy=False)
+                z_now = Z_f[v, u].astype(np.float32, copy=False)
+
+                hit_local = (z_now > 0.0)
+                hit_f[np.where(valid_f)[0][hit_local]] = True
+
+                thr = z_now - margin
+                del_local = (z_now > 0.0) & (z_m < thr)
+                del_f[np.where(valid_f)[0][del_local]] = True
+
+        # ---------- D405 hit / delete ----------
+        hit_d = np.zeros((N,), dtype=bool)
+        del_d = np.zeros((N,), dtype=bool)
+
+        if Z_d is not None and Z_d.size > 0:
+            if Z_d.shape != (int(H_d), int(W_d)):
+                raise ValueError(f"Z_d shape must be ({H_d},{W_d}), got {Z_d.shape}")
+
+            u_d, v_d, z_d, idx = self._project_base_to_cam_pinhole_torch(
+                self._mem_xyz, base_to_cam_d, K_d, int(W_d), int(H_d)
             )
+            if idx.size > 0:
+                z_now_d = Z_d[v_d, u_d].astype(np.float32, copy=False)
 
-            if use_cache:
-                # cached: u,v int / zcam in meters
-                u_f = np.asarray(self._mem_u, dtype=np.int32)
-                v_f = np.asarray(self._mem_v, dtype=np.int32)
-                z_f = np.asarray(self._mem_zcam, dtype=np.float32)
-            else:
-                # fallback: project mem_xyz to femto
-                u_f, v_f, z_f, in_idx = self._project_base_to_cam_torch(mem_xyz_base)
-                # make sure numpy types
-                if isinstance(u_f, torch.Tensor): u_f = u_f.detach().cpu().numpy()
-                if isinstance(v_f, torch.Tensor): v_f = v_f.detach().cpu().numpy()
-                if isinstance(z_f, torch.Tensor): z_f = z_f.detach().cpu().numpy()
-                u_f = np.asarray(u_f, dtype=np.int32)
-                v_f = np.asarray(v_f, dtype=np.int32)
-                z_f = np.asarray(z_f, dtype=np.float32)
+                hit_local = (z_now_d > 0.0)
+                hit_d[idx[hit_local]] = True
 
-            # gather current depth at projected pixels
-            z_now_f = self._gather_zbuf_np(zbuf_f, u_f, v_f)
+                thr = z_now_d - margin
+                del_local = (z_now_d > 0.0) & (z_d.astype(np.float32, copy=False) < thr)
+                del_d[idx[del_local]] = True
 
-            # free-space delete rule:
-            # if current depth valid and mem point is strictly in front of observed surface by margin
-            # => point lies in free space -> delete
-            del_f = (z_now_f > 0.0) & (z_f > 0.0) & (z_f < (z_now_f - free_margin))
-            delete_mask |= del_f
+        # ---------- miss update: hit_any ----------
+        hit_any = hit_f | hit_d
+        self._mem_miss[hit_any] = 0
+        self._mem_miss[~hit_any] = np.minimum(self._mem_miss[~hit_any] + 1, np.int16(32767))
 
-            # ---------------- HIT MASK (optional) ----------------
-            # hit_margin = float(getattr(self, "_hit_margin_m", 0.015))
-            # hit_f = (z_now_f > 0.0) & (z_f > 0.0) & (np.abs(z_f - z_now_f) <= hit_margin)
-            # self._last_hit_mask_femto = hit_f
+        # ---------- miss-based delete ----------
+        age_all = (self._frame_idx - self._mem_step)
+        del_by_miss = (self._mem_miss >= self._miss_prune_frames) & (age_all >= self._miss_min_age)
 
-        # ============================================================
-        # (2) D405 view pruning (dynamic extrinsics, cannot cache across frames)
-        # ============================================================
-        if (
-            d405_depth_u16 is not None
-            and d405_cam_to_base is not None
-            and K_d405 is not None
-            and d405_wh is not None
-        ):
-            zbuf_d = self._zmin_from_depth_u16(d405_depth_u16, z_unit=d405_z_unit)
-            if isinstance(zbuf_d, torch.Tensor):
-                zbuf_d = zbuf_d.detach().cpu().numpy()
-            zbuf_d = np.asarray(zbuf_d, dtype=np.float32)
-
-            W_d, H_d = int(d405_wh[0]), int(d405_wh[1])
-
-            # base -> d405 cam
-            T_base_cam = np.asarray(d405_cam_to_base, dtype=np.float64)
-            T_cam_base = np.linalg.inv(T_base_cam)
-
-            xyz = mem_xyz_base.astype(np.float64, copy=False)
-            xyz_h = np.concatenate([xyz, np.ones((Nm, 1), dtype=np.float64)], axis=1)
-            xyz_cam = (T_cam_base @ xyz_h.T).T[:, :3].astype(np.float32, copy=False)
-
-            # pinhole projection (no distortion)
-            fx = float(K_d405[0, 0]); fy = float(K_d405[1, 1])
-            cx = float(K_d405[0, 2]); cy = float(K_d405[1, 2])
-
-            z = xyz_cam[:, 2]
-            valid = z > 0.0
-            u = np.full((Nm,), -1, dtype=np.int32)
-            v = np.full((Nm,), -1, dtype=np.int32)
-            if np.any(valid):
-                x = xyz_cam[valid, 0]
-                y = xyz_cam[valid, 1]
-                zz = z[valid]
-                u_proj = np.rint((x / zz) * fx + cx).astype(np.int32)
-                v_proj = np.rint((y / zz) * fy + cy).astype(np.int32)
-                u[valid] = u_proj
-                v[valid] = v_proj
-
-            # gather d405 depth at projected pixels
-            # NOTE: zbuf_d shape should match depth image (H,W). We trust that.
-            z_now_d = self._gather_zbuf_np(zbuf_d, u, v)
-
-            del_d = (z_now_d > 0.0) & (z > 0.0) & (z < (z_now_d - free_margin))
-            delete_mask |= del_d
-
-            # ---------------- HIT MASK (optional) ----------------
-            # hit_margin = float(getattr(self, "_hit_margin_m", 0.015))
-            # hit_d = (z_now_d > 0.0) & (z > 0.0) & (np.abs(z - z_now_d) <= hit_margin)
-            # self._last_hit_mask_d405 = hit_d
-
-        return delete_mask
+        # ---------- final delete ----------
+        del_free_space = del_f | del_d
+        if np.any(del_free_space) or np.any(del_by_miss):
+            keep = ~(del_free_space | del_by_miss)
+            self._delete_mask(keep)
 
     # ----------------------------
     # public: process / process_wrist / process_global
@@ -984,7 +875,7 @@ class PointCloudPreprocessor:
         K_d405: np.ndarray,               # (3,3)
         d405_wh: tuple,                   # (W,H)
         femto_z_unit: str = "mm",
-        d405_z_unit: str = "mm",
+        d405_z_unit: str = "0.1mm",
     ) -> np.ndarray:
         """
         - (A) Femto PC는 기존 process와 동일하게 TF/crop/filter
@@ -1040,6 +931,7 @@ class PointCloudPreprocessor:
             out = self._export_array_from_mem(now_step)
             self._frame_idx += 1
             return out
+
         if pts_f.size and pts_d.size:
             pts_now = np.concatenate([pts_f, pts_d], axis=0)
         else:
@@ -1095,9 +987,6 @@ class PointCloudPreprocessor:
             (points[:, 2] <= self.workspace_bounds[2][1])
         )
         return points[mask]
-    
-    
-
 
     # ----------------------------
     # variance filter / sampling (기존 유지)
@@ -1171,315 +1060,3 @@ class PointCloudPreprocessor:
         if self.use_cuda:
             sampled_points = sampled_points.cpu()
         return sampled_points.numpy(), indices
-
-
-
-
-class LowDimPreprocessor:
-    def __init__(self,
-                 robot_to_base=None
-                ):
-        if robot_to_base is None:
-            self.robot_to_base=np.array([
-                [1., 0., 0., -0.04],
-                [0., 1., 0., -0.29],
-                [0., 0., 1., -0.03],
-                [0., 0., 0.,  1.0]
-            ])
-        else:
-            self.robot_to_base = np.array(robot_to_base, dtype=np.float32)
-        
-    
-    def TF_process(self, robot_7ds):
-        assert robot_7ds.shape[-1] == 7, f"robot_7ds data shape shoud be (..., 7), but got {robot_7ds.shape}"
-        processed_robot7d = []
-        for robot_7d in robot_7ds:
-            pose_6d = robot_7d[:6]
-            gripper = robot_7d[6]
-            
-            translation = pose_6d[:3]
-            rotation = pose_6d[3:6]
-            eef_to_robot_base_k = rise_tf.rot_trans_mat(translation, rotation)
-            T_k_matrix = self.robot_to_base @ eef_to_robot_base_k
-            transformed_pose_6d = rise_tf.mat_to_xyz_rot(
-                T_k_matrix,
-                rotation_rep='euler_angles',
-                rotation_rep_convention='ZYX'
-            )
-            new_robot_7d = np.concatenate([transformed_pose_6d, [gripper]])
-            processed_robot7d.append(new_robot_7d)
-        
-        return np.array(processed_robot7d, dtype=np.float32)
-
-
-
-
-def create_default_preprocessor(target_num_points=1024, use_cuda=True, verbose=False):
-    return PointCloudPreprocessor(
-        target_num_points=target_num_points,
-        use_cuda=use_cuda,
-        verbose=verbose
-    )
-
-
-def downsample_obs_data(obs_data, downsample_factor=3, offset=0):
-
-
-    downsampled_data = {}
-    for key, value in obs_data.items():
-        if isinstance(value, np.ndarray) and value.ndim > 0:
-            assert 0 <= offset < downsample_factor, "offset out of range"
-            downsampled_data[key] = value[offset::downsample_factor].copy()
-        else:
-            downsampled_data[key] = value
-
-    return downsampled_data
-
-
-def align_obs_action_data(obs_data, action_data, obs_timestamps, action_timestamps):
-
-    valid_indices = []
-    aligned_action_indices = []
-    
-    for i, obs_ts in enumerate(obs_timestamps):
-        future_actions = action_timestamps >= obs_ts
-        if np.any(future_actions):
-            action_idx = np.where(future_actions)[0][0]
-            valid_indices.append(i)
-            aligned_action_indices.append(action_idx)
-    
-    if len(valid_indices) == 0:
-        print("Warning: No valid obs-action alignments found!")
-        return {}, {}, []
-    
-    aligned_obs_data = {}
-    for key, value in obs_data.items():
-        if isinstance(value, np.ndarray) and len(value.shape) > 0:
-            aligned_obs_data[key] = value[valid_indices]
-        else:
-            aligned_obs_data[key] = value
-            
-    aligned_action_data = {}
-    for key, value in action_data.items():
-        if isinstance(value, np.ndarray) and len(value.shape) > 0:
-            aligned_action_data[key] = value[aligned_action_indices]
-        else:
-            aligned_action_data[key] = value
-    return aligned_obs_data, aligned_action_data, valid_indices
-
-
-
-def process_single_episode(episode_path, pc_preprocessor=None, lowdim_preprocessor=None, 
-                            downsample_factor=3, downsample_offset=0):
-
-    episode_path = pathlib.Path(episode_path)
-    if pc_preprocessor is not None and hasattr(pc_preprocessor, "reset_temporal"):
-        pc_preprocessor.reset_temporal()
-    
-    obs_zarr_path = episode_path / 'obs_replay_buffer.zarr'
-    action_zarr_path = episode_path / 'action_replay_buffer.zarr'
-    
-    if not obs_zarr_path.exists() or not action_zarr_path.exists():
-        raise FileNotFoundError(f"Missing zarr files in {episode_path}")
-    
-    obs_replay_buffer = ReplayBuffer.create_from_path(str(obs_zarr_path), mode='r')
-    action_replay_buffer = ReplayBuffer.create_from_path(str(action_zarr_path), mode='r')
-
-    obs_data ={}
-    for key in obs_replay_buffer.keys():
-        obs_data[key] = obs_replay_buffer[key][:]
-    
-    action_data ={}
-    for key in action_replay_buffer.keys():
-        action_data[key] = action_replay_buffer[key][:]
-
-    downsampled_obs = downsample_obs_data(obs_data, downsample_factor=downsample_factor, offset=downsample_offset)
-    downsampled_obs_timestamps = downsampled_obs['align_timestamp']
-    action_timestamps = action_data['timestamp']
-    
-    aligned_obs, aligned_action, valid_indices = align_obs_action_data(
-        downsampled_obs, action_data, 
-        downsampled_obs_timestamps, action_timestamps)
-    
-    
-    if len(valid_indices) == 0:
-        return None
-        
-    if pc_preprocessor is not None and 'pointcloud' in aligned_obs:
-        processed_pointclouds = []
-        for pc in aligned_obs['pointcloud']:
-            processed_pc = pc_preprocessor.process(pc)
-            processed_pointclouds.append(processed_pc)
-        aligned_obs['pointcloud'] = np.array(processed_pointclouds, dtype=object)
-    
-    
-    robot_eef_pose = aligned_obs['robot_eef_pose']
-    robot_gripper_width = aligned_obs['robot_gripper'][:, :1] 
-    aligned_obs['robot_obs'] = np.concatenate([robot_eef_pose, robot_gripper_width], axis=1) 
-    
-
-    if lowdim_preprocessor is not None:
-        aligned_obs['robot_obs'] = lowdim_preprocessor.TF_process(aligned_obs['robot_obs'])
-        aligned_action['action'] = lowdim_preprocessor.TF_process(aligned_action['action'])
-    
-    episode_data = {}
-    episode_data.update(aligned_obs)
-    episode_data.update(aligned_action)
-    
-    return episode_data
-
-
-def parse_shape_meta(shape_meta: dict) -> Tuple[List[str], List[str], dict, dict]:
-    pointcloud_keys = []
-    lowdim_keys = []
-    pointcloud_configs = {}
-    lowdim_configs = {}
-    
-    obs_shape_meta = shape_meta.get('obs', {})
-    for key, attr in obs_shape_meta.items():
-        obs_type = attr.get('type', 'low_dim')
-        shape = tuple(attr.get('shape', []))
-        
-        if obs_type == 'pointcloud':
-            pointcloud_keys.append(key)
-            pointcloud_configs[key] = {
-                'shape': shape,
-                'type': obs_type
-            }
-        elif obs_type == 'low_dim':
-            lowdim_keys.append(key)
-            lowdim_configs[key] = {
-                'shape': shape,
-                'type': obs_type
-            }
-    
-    return pointcloud_keys, lowdim_keys, pointcloud_configs, lowdim_configs
-
-
-def validate_episode_data_with_shape_meta(episode_data: dict, shape_meta: dict) -> bool:
-
-    pointcloud_keys, lowdim_keys, pointcloud_configs, lowdim_configs = parse_shape_meta(shape_meta)
-    
-    for key in pointcloud_keys:
-        if key in episode_data:
-            data = episode_data[key]
-            expected_shape = pointcloud_configs[key]['shape']
-            if len(data.shape) >= 2:
-                if data.shape[-len(expected_shape):] != expected_shape:
-                    print(f"Warning: {key} shape mismatch. Expected: {expected_shape}, Got: {data.shape}")
-                    return False
-        else:
-            print(f"Warning: Expected pointcloud key '{key}' not found in episode data")
-            return False
-    
-    for key in lowdim_keys:
-        if key in episode_data:
-            data = episode_data[key]
-            expected_shape = lowdim_configs[key]['shape']
-            if len(expected_shape)==1:
-                if expected_shape[0] == 1 and len(data.shape) == 1:
-                    continue
-
-            if len(data.shape) >= 1:
-                if data.shape[-len(expected_shape):] != expected_shape:
-                    print(f"Warning: {key} shape mismatch. Expected: {expected_shape}, Got: {data.shape}")
-                    return False
-        else:
-            print(f"Warning: Expected lowdim key '{key}' not found in episode data")
-            return False
-    
-    action_shape_meta = shape_meta.get('action', {})
-    if 'action' in episode_data and 'shape' in action_shape_meta:
-        expected_action_shape = tuple(action_shape_meta['shape'])
-        actual_action_shape = episode_data['action'].shape[-len(expected_action_shape):]
-        if actual_action_shape != expected_action_shape:
-            print(f"Warning: Action shape mismatch. Expected: {expected_action_shape}, Got: {actual_action_shape}")
-            return False
-    
-    return True
-
-
-def _get_replay_buffer(
-        dataset_path: str,
-        shape_meta: dict,
-        store: Optional[zarr.ABSStore] = None,
-        pc_preprocessor: Optional[PointCloudPreprocessor] = None,
-        lowdim_preprocessor: Optional[LowDimPreprocessor] = None,
-        downsample_factor: int = 3,
-        downsample_use_all_offsets: bool = False,
-        max_episodes: Optional[int] = None,
-        n_workers: int = 1
-) -> ReplayBuffer:
-
-    if store is None:
-        store = zarr.MemoryStore()
-        
-    dataset_path = pathlib.Path(dataset_path)
-    if not dataset_path.exists():
-        raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
-    False
-    pointcloud_keys, lowdim_keys, pointcloud_configs, lowdim_configs = parse_shape_meta(shape_meta)
-    
-    print(f"Parsed shape_meta:")
-    print(f"  - Pointcloud keys: {pointcloud_keys}")
-    print(f"  - Lowdim keys: {lowdim_keys}")
-    print(f"  - Action shape: {shape_meta.get('action', {}).get('shape', 'undefined')}")
-    print(f"  - downsample_factor: {downsample_factor}")
-    episode_dirs = []
-    for item in sorted(dataset_path.iterdir()):
-        if item.is_dir() and item.name.startswith('episode_'):
-            episode_dirs.append(item)
-            
-    if max_episodes is not None:
-        episode_dirs = episode_dirs[:max_episodes]
-        
-    print(f"Found {len(episode_dirs)} episodes to process")
-    
-    if len(episode_dirs) == 0:
-        raise ValueError("No episode directories found")
-    
-    replay_buffer = ReplayBuffer.create_empty_zarr(storage=store)
-    
-    with tqdm(total=len(episode_dirs), desc="Processing episodes", mininterval=1.0) as pbar:
-        offsets = list(range(downsample_factor)) if downsample_use_all_offsets else [0]
-        for episode_dir in episode_dirs:
-            try:
-                for off in offsets:
-                    episode_data = process_single_episode(
-                        episode_dir, 
-                        pc_preprocessor, 
-                        lowdim_preprocessor, 
-                        downsample_factor,
-                        downsample_offset=off
-                    )
-
-                    if episode_data is not None:
-                        if validate_episode_data_with_shape_meta(episode_data, shape_meta):
-                            L = len(episode_data['align_timestamp'])
-                            episode_data['meta_source_episode'] = np.array([episode_dir.name]*L, dtype='S64')
-                            episode_data['meta_downsample_offset'] = np.full((L,), off, dtype=np.int16)
-                            for key in episode_data.keys():
-                                if isinstance(episode_data[key], list):
-                                    episode_data[key] = np.asarray(episode_data[key])
-
-                            replay_buffer.add_episode(episode_data,
-                                object_codecs={'pointcloud': numcodecs.Pickle()})
-                            pbar.set_postfix(
-                                episodes=replay_buffer.n_episodes,
-                                steps=replay_buffer.n_steps
-                            )
-                        else:
-                            print(f"Skipping episode {episode_dir.name} due to shape validation failure")
-                    else:
-                        print(f"Skipping empty episode: {episode_dir.name}")
-
-            except Exception as e:
-                print(f"Error processing {episode_dir.name}: {e}")
-                continue
-                
-            pbar.update(1)
-    
-    print(f"Successfully processed {replay_buffer.n_episodes} episodes "
-        f"with {replay_buffer.n_steps} total steps")
-    
-    return replay_buffer
