@@ -19,7 +19,14 @@ from pcdp.common.pytorch_util import dict_apply
 from pcdp.dataset.base_dataset import BasePointCloudDataset
 from pcdp.model.common.normalizer import LinearNormalizer
 from pcdp.common.replay_buffer import ReplayBuffer
-from pcdp.real_world.real_data_pc_conversion import _get_replay_buffer, PointCloudPreprocessor, LowDimPreprocessor
+from pcdp.real_world.real_data_pc_conversion import (
+    _get_replay_buffer,
+    PointCloudPreprocessor,
+    LowDimPreprocessor,
+    FemtoConfig,
+    D405Config,
+    robot_to_base as DEFAULT_ROBOT_TO_BASE,
+)
 from pcdp.common.sampler import (
     SequenceSampler, get_val_mask, downsample_mask)
 from pcdp.model.common.normalizer import SingleFieldLinearNormalizer
@@ -34,6 +41,65 @@ def _to_py(x):
     if isinstance(x, (DictConfig, ListConfig)):
         return OmegaConf.to_container(x, resolve=True)
     return x
+
+
+def _build_pc_preprocessor_from_cfg(pc_preprocessor_config):
+
+    if pc_preprocessor_config is None:
+        return None
+
+    cfg = _to_py(pc_preprocessor_config)
+    cfg = dict(cfg)  # shallow copy
+
+    if 'workspace_bounds' not in cfg:
+        raise ValueError("pc_preprocessor_config에 workspace_bounds가 필요합니다.")
+    workspace_bounds = np.asarray(cfg.pop('workspace_bounds'), dtype=np.float64)
+
+    sensor_mode = cfg.pop('sensor_mode', 'both')
+
+    femto_cfg_data = cfg.pop('femto', None)
+
+    if femto_cfg_data is None and all(k in cfg for k in ('extrinsics_matrix', 'K_depth', 'depth_width', 'depth_height')):
+        femto_cfg_data = {
+            'cam_to_base': cfg.pop('extrinsics_matrix'),
+            'K': cfg.pop('K_depth'),
+            'width': cfg.pop('depth_width'),
+            'height': cfg.pop('depth_height'),
+            'var_ksize': cfg.pop('var_ksize', 5),
+            'var_std_thresh_m': cfg.pop('var_std_thresh_m', 0.004),
+            'var_min_depth_m': cfg.pop('var_min_depth_m', 0.01),
+            'var_max_depth_m': cfg.pop('var_max_depth_m', 1e6),
+        }
+
+    femto_cfg = FemtoConfig(**femto_cfg_data) if femto_cfg_data is not None else None
+
+    # D405 config
+    d405_cfg_data = cfg.pop('d405', None)
+    if d405_cfg_data is not None:
+        d405_cfg_data = dict(d405_cfg_data)
+        d405_cfg_data.setdefault('robot_to_base', DEFAULT_ROBOT_TO_BASE)
+        d405_cfg = D405Config(**d405_cfg_data)
+    else:
+        d405_cfg = None
+
+    if sensor_mode in ('both', 'd405') and d405_cfg is None:
+        if femto_cfg is not None:
+            sensor_mode = 'femto'  
+        else:
+            raise ValueError("sensor_mode에 d405가 포함되어 있지만 d405 설정이 없습니다.")
+    if sensor_mode in ('both', 'femto') and femto_cfg is None:
+        if d405_cfg is not None:
+            sensor_mode = 'd405'
+        else:
+            raise ValueError("sensor_mode에 femto가 포함되어 있지만 femto 설정이 없습니다.")
+
+    return PointCloudPreprocessor(
+        workspace_bounds=workspace_bounds,
+        femto=femto_cfg,
+        d405=d405_cfg,
+        sensor_mode=sensor_mode,
+        **cfg,
+    )
 
 class PCM_RealStackPointCloudDataset(BasePointCloudDataset):
     def __init__(self,
@@ -65,8 +131,7 @@ class PCM_RealStackPointCloudDataset(BasePointCloudDataset):
 
         pc_preprocessor = None
         if enable_pc_preprocessing:
-            pc_kwargs = OmegaConf.to_container(pc_preprocessor_config, resolve=True) if pc_preprocessor_config else {}
-            pc_preprocessor = PointCloudPreprocessor(**pc_kwargs)
+            pc_preprocessor = _build_pc_preprocessor_from_cfg(pc_preprocessor_config)
         
         low_dim_preprocessor = None
         if enable_low_dim_preprocessing:
@@ -275,24 +340,7 @@ class PCM_RealStackPointCloudDataset(BasePointCloudDataset):
                 input_stats_dict=color_stats_torch
             )
             normalizer['pointcloud_color'] = color_normalizer
-        # ==========================================================
 
-        # ========= ORIGINAL CODE (COMMENTED OUT) =========
-        # all_colors = []
-        # for i in tqdm(range(self.replay_buffer.n_episodes), desc="Calculating PointCloud Color Stats"):
-        #     data = self.replay_buffer.get_episode(i)
-        #     points = data['pointcloud']
-        #     for pc in points:
-        #         if len(pc) > 0:
-        #             all_colors.append(pc[:, 3:6])
-        # 
-        # if all_colors:
-        #     all_colors = np.concatenate(all_colors, axis=0) 
-        #     all_colors = torch.from_numpy(all_colors).to(device)
-        #     color_normalizer = SingleFieldLinearNormalizer.create_fit(all_colors, mode='gaussian')
-        #     normalizer['pointcloud_color'] = color_normalizer
-        # =================================================
-        
         return normalizer
 
     

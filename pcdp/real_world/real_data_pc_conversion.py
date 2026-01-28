@@ -1,7 +1,5 @@
 # real_data_pc_conversion_v2.py
 
-
-
 from typing import Tuple, Optional, List
 import pathlib
 import cv2
@@ -14,15 +12,13 @@ from dataclasses import dataclass
 from pcdp.common import RISE_transformation as rise_tf
 from pcdp.common.replay_buffer import ReplayBuffer
 
-# === Fixed sensor defaults (hardcoded) ===
-# Femto depth/pointcloud: millimeters; D405 depth: 0.1mm (RealSense scale)
 FEMTO_DEPTH_W, FEMTO_DEPTH_H = 320, 288
 D405_STRIDE = 1
 
 robot_to_base = np.array([
     [1., 0., 0., -0.04],
-    [0., 1., 0., -0.29],
-    [0., 0., 1., -0.03],
+    [0., 1., 0., -0.295],
+    [0., 0., 1., -0.027],
     [0., 0., 0.,  1.0]
 ])
 
@@ -105,12 +101,11 @@ def voxel_keys_from_xyz(xyz: np.ndarray, voxel_size: float) -> np.ndarray:
     return grid.view(np.dtype((np.void, 12))).ravel()
 
 
-# variance filter + depth threshold
 def depth_variance_filter(
     depth: np.ndarray,
     depth_to_meters_fn,
     ksize: int = 5,
-    std_thresh_m: float = 0.004,   # 4mm 정도부터 시작 추천
+    std_thresh_m: float = 0.004,   
     min_depth_m: float = 0.05,
     max_depth_m: float = 2.0,
 ) -> np.ndarray:
@@ -130,11 +125,9 @@ def depth_variance_filter(
         out = np.zeros_like(depth)
         return out
 
-    # invalid는 0으로 두고 boxFilter 수행
     x = np.where(valid, depth_m, 0.0).astype(np.float32)
     ones = valid.astype(np.float32)
 
-    # E[x], E[x^2] (valid만 평균)
     mean_x = cv2.boxFilter(x, ddepth=-1, ksize=(ksize, ksize), normalize=False, borderType=cv2.BORDER_DEFAULT)
     mean_x2 = cv2.boxFilter(x * x, ddepth=-1, ksize=(ksize, ksize), normalize=False, borderType=cv2.BORDER_DEFAULT)
     cnt = cv2.boxFilter(ones, ddepth=-1, ksize=(ksize, ksize), normalize=False, borderType=cv2.BORDER_DEFAULT)
@@ -163,8 +156,6 @@ def d405_depth_to_pointcloud(
         return np.zeros((0, 6), dtype=np.float32)
 
     fx, fy, cx, cy = _parse_intrinsics(intrinsics)
-    # Depth scale is sensor-fixed; ignore provided unit and use defaults
-    # D405 depth is 0.1mm scale (fixed)
     depth_m = _d405_depth_to_meters(depth)
 
     H, W = depth_m.shape
@@ -183,7 +174,6 @@ def d405_depth_to_pointcloud(
     uu, vv = np.meshgrid(u, v)
     z = depth_m[vv, uu]
 
-    # max_depth_m pruning is already applied upstream in depth_variance_filter
     valid = (z > 0.0)
     if not np.any(valid):
         return np.zeros((0, 6), dtype=np.float32)
@@ -205,16 +195,11 @@ def d405_depth_to_pointcloud(
 
 def femto_filter_pointcloud_by_depth_mask(
     femto_points_cam: np.ndarray,     # (N,6) xyz + rgb, Femto camera frame (mm)
-    depth_masked: np.ndarray,         # variance-filter 적용된 depth (0이면 제거)
+    depth_masked: np.ndarray,         
     K: np.ndarray,                    # 3x3 intrinsics
     z_consistency_eps_m: float = 0.01,
     use_z_consistency: bool = True,
 ) -> np.ndarray:
-    """
-    Femto처럼 depth로 PC 재생성이 불가한 경우:
-    - variance-filter된 depth에서 살아남은 픽셀만 유지하도록
-      point cloud를 다시 투영(u,v)해서 매칭 후 제거.
-    """
     if femto_points_cam is None or femto_points_cam.size == 0:
         return np.zeros((0, 6), dtype=np.float32)
     if depth_masked is None:
@@ -225,7 +210,6 @@ def femto_filter_pointcloud_by_depth_mask(
 
     xyz = femto_points_cam[:, :3].astype(np.float32, copy=False)
 
-    # femto pointcloud는 mm 단위로 가정
     xyz_m = xyz * 1e-3
 
     z = xyz_m[:, 2]
@@ -246,7 +230,6 @@ def femto_filter_pointcloud_by_depth_mask(
     u_in = u[inb]
     v_in = v[inb]
 
-    # depth_masked에서 0이 아닌 픽셀만 keep
     ok_pix = depth_masked[v_in, u_in] > 0
     if not np.any(ok_pix):
         return np.zeros((0, 6), dtype=np.float32)
@@ -298,7 +281,7 @@ def _project_points_to_pixels(points_cam_xyz_m: np.ndarray, K: np.ndarray, width
 @dataclass
 class D405Config:
     d405_cam_to_eef: np.ndarray                 # (4,4) eef<-cam
-    robot_to_base: np.ndarray                   # (4,4) base<-robot  (너 코드의 ROBOT_TO_BASE)
+    robot_to_base: np.ndarray                   # (4,4) base<-robot  
     stride: int = D405_STRIDE
     max_depth_m: float = 0.25                   # can be overridden from YAML
     var_ksize: int = 5
@@ -320,21 +303,6 @@ class FemtoConfig:
 
 
 class PointCloudPreprocessor:
-    """
-    목표 파이프라인(요약):
-      - Femto:
-          femto_depth(raw)            -> (occlusion prune용 z-buffer 비교에 사용, depth==0은 unknown)
-          femto_depth_var(variance)   -> femto_points를 재투영해 마스킹 -> current cloud(merge용)
-      - D405:
-          d405_depth(raw)             -> (occlusion prune용 z-buffer 비교에 사용, depth==0 unknown)
-          d405_depth_var(variance)    -> (depth_var + color)로 PC 생성 -> current cloud(merge용)
-
-    메모리 업데이트:
-      memory(t) = prune(memory(t-1), current_raw_depths)  # free-space carve (raw depth 기반)
-      memory(t) = voxel_merge(memory(t), current_points)  # current가 voxel 우선
-      confidence c는 memory에만 decay, current는 c=1
-    """
-
     def __init__(
         self,
         workspace_bounds: np.ndarray,
@@ -392,7 +360,6 @@ class PointCloudPreprocessor:
         pts = points.astype(np.float32, copy=False)
         xyz = pts[:, :3].astype(np.float64)
 
-        # femto pointcloud는 mm 단위로 가정
         xyz_m = xyz * 1e-3
 
         xyz_base = transform_points(self.femto.cam_to_base, xyz_m) if self.enable_TF else xyz_m
@@ -402,9 +369,6 @@ class PointCloudPreprocessor:
             out = crop_workspace_points(out, self.workspace_bounds)
         return out.astype(np.float32, copy=False)
 
-    # ----------------------------
-    # Helpers to build current clouds
-    # ----------------------------
     def _build_femto_current(self, femto_points, femto_depth):
         if self.femto is None:
             raise RuntimeError("FemtoConfig is required for femto mode.")
@@ -548,7 +512,6 @@ class PointCloudPreprocessor:
 
         # ---- temporal update ----
         if not self.enable_temporal:
-            # confidence 없이 fused 반환(visual 호환 위해 c=1)
             if current.size == 0:
                 return np.zeros((0, 7), dtype=np.float32)
             c = np.ones((current.shape[0], 1), dtype=np.float32)
@@ -587,14 +550,6 @@ class PointCloudPreprocessor:
         views,                       # list of ("name", depth_raw, depth_to_m_fn, base_to_cam, K, (W,H))
         margin_m: float,
     ) -> np.ndarray:
-        """
-        Free-space carving rule (conservative, raw depth 기반):
-          - memory point를 camera로 투영해서 (u,v,z_mem) 계산
-          - current depth z_cur가 0이면 unknown -> prune 근거 없음 -> keep
-          - z_cur > z_mem + margin 이면 그 ray는 memory point까지 free-space로 관측됨 -> delete
-          - else keep
-        Multi-view 결합: "any view에서 delete 조건 만족하면 delete"
-        """
         if memory_xyzrgbc.size == 0:
             return memory_xyzrgbc
 
@@ -610,13 +565,6 @@ class PointCloudPreprocessor:
             u, v, z_mem = _project_points_to_pixels(xyz_cam, K, W, H)
             if u.size == 0:
                 continue
-
-            # z_mem은 idx subset에서 valid만 남은 상태라서, 다시 매칭이 필요
-            # 간단하게: valid projection mask를 다시 만들어 index mapping 하는 방식
-            # -> 구현을 깔끔하게 하려면 한 번 더 전체를 projection해서 mask 얻는게 안정적이지만,
-            #    여기서는 idx subset 기준으로 진행.
-
-            # subset 기준으로 다시 projection mask를 얻기 위해 동일 계산을 재수행
             fx, fy, cx, cy = float(K[0,0]), float(K[1,1]), float(K[0,2]), float(K[1,2])
             x = xyz_cam[:, 0].astype(np.float32, copy=False)
             y = xyz_cam[:, 1].astype(np.float32, copy=False)
@@ -640,21 +588,14 @@ class PointCloudPreprocessor:
             z_cur = depth_to_m_fn(depth_raw)[vv, uu]
             known = z_cur > 0.0
 
-            # delete 조건: z_cur > z_mem + margin
-            delete = known & (z_cur > (zz + float(margin_m)))
+            delete = known & (z_cur > (zz - float(margin_m)))
             if np.any(delete):
                 keep[idx_valid[delete]] = False
 
         return memory_xyzrgbc[keep]
 
     def _voxel_merge_memory_and_current(self, mem_xyzrgbc: np.ndarray, cur_xyzrgb: np.ndarray) -> np.ndarray:
-        """
-        mem: (M,7) base
-        cur: (N,6) base
-        output: (K,7) base
-        - voxel 단위로 unique
-        - current가 voxel 우선(override)
-        """
+
         if cur_xyzrgb.size == 0 and mem_xyzrgbc.size == 0:
             return np.zeros((0, 7), dtype=np.float32)
 
@@ -666,18 +607,15 @@ class PointCloudPreprocessor:
         cur7 = np.concatenate([cur, cur_c], axis=1)
 
         if mem_xyzrgbc.size == 0:
-            # voxel unique만 한번
             keys = voxel_keys_from_xyz(cur7[:, :3].astype(np.float64), self.temporal_voxel_size)
             rev = np.arange(keys.shape[0]-1, -1, -1)
             _, first = np.unique(keys[rev], return_index=True)
             keep = np.sort(rev[first])
             return cur7[keep]
 
-        # decay/prune된 mem과 current 결합 -> voxel unique (current wins)
         combined = np.concatenate([mem_xyzrgbc.astype(np.float32, copy=False), cur7], axis=0)
         keys = voxel_keys_from_xyz(combined[:, :3].astype(np.float64), self.temporal_voxel_size)
 
-        # "last wins"를 위해 reverse unique
         rev = np.arange(keys.shape[0]-1, -1, -1)
         _, first = np.unique(keys[rev], return_index=True)
         keep = np.sort(rev[first])
@@ -722,14 +660,6 @@ class LowDimPreprocessor:
         return np.array(processed_robot7d, dtype=np.float32)
 
 
-
-
-def create_default_preprocessor(target_num_points=1024, use_cuda=True, verbose=False):
-    return PointCloudPreprocessor(
-        target_num_points=target_num_points,
-        use_cuda=use_cuda,
-        verbose=verbose
-    )
 
 
 def downsample_obs_data(obs_data, downsample_factor=3, offset=0):
@@ -814,9 +744,26 @@ def process_single_episode(episode_path, pc_preprocessor=None, lowdim_preprocess
         
     if pc_preprocessor is not None and 'pointcloud' in aligned_obs:
         processed_pointclouds = []
-        for pc in aligned_obs['pointcloud']:
-            processed_pc = pc_preprocessor.process(pc)
-            processed_pointclouds.append(processed_pc)
+        T = len(aligned_obs['pointcloud'])
+        for i in range(T):
+            femto_points = aligned_obs.get('pointcloud', [None]*T)[i]
+            femto_depth  = aligned_obs.get('depth_image', [None]*T)[i] if 'depth_image' in aligned_obs else None
+            d405_depth   = aligned_obs.get('eef_depth_image', [None]*T)[i] if 'eef_depth_image' in aligned_obs else None
+            d405_color   = aligned_obs.get('eef_color_image', [None]*T)[i] if 'eef_color_image' in aligned_obs else None
+            d405_intr    = aligned_obs.get('eef_intrinsics', [None]*T)[i] if 'eef_intrinsics' in aligned_obs else None
+            robot_eef_pose = aligned_obs.get('robot_eef_pose', [None]*T)[i] if 'robot_eef_pose' in aligned_obs else None
+
+            processed_pc = pc_preprocessor.process_global(
+                femto_points=femto_points,
+                femto_depth=femto_depth,
+                d405_depth=d405_depth,
+                d405_color=d405_color,
+                d405_intrinsics=d405_intr,
+                robot_eef_pose=robot_eef_pose,
+                export_mode="fused",
+            )
+            processed_pointclouds.append(processed_pc.astype(np.float32, copy=False))
+
         aligned_obs['pointcloud'] = np.array(processed_pointclouds, dtype=object)
     
     
@@ -924,7 +871,6 @@ def _get_replay_buffer(
     dataset_path = pathlib.Path(dataset_path)
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
-    False
     pointcloud_keys, lowdim_keys, pointcloud_configs, lowdim_configs = parse_shape_meta(shape_meta)
     
     print(f"Parsed shape_meta:")
