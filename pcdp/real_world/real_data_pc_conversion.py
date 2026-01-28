@@ -1,29 +1,23 @@
-# real_data_pc_conversion.py
+# real_data_pc_conversion_v2.py
 
 
 
-from typing import Sequence, Tuple, Dict, Optional, Union, List
-import os
+from typing import Tuple, Optional, List
 import pathlib
 import cv2
 import numpy as np
 import zarr
 import numcodecs
 from tqdm import tqdm
-import open3d as o3d
-import torch
-import pcdp.common.mono_time as mono_time
-try:
-    import pytorch3d.ops as torch3d_ops
-    PYTORCH3D_AVAILABLE = True
-except ImportError:
-    PYTORCH3D_AVAILABLE = False
-    print("Warning: pytorch3d not available. FPS will use fallback method.")
-
+from dataclasses import dataclass
 
 from pcdp.common import RISE_transformation as rise_tf
-from pcdp.common.replay_buffer import ReplayBuffer, get_optimal_chunks
-from pcdp.common.RISE_transformation import xyz_rot_transform
+from pcdp.common.replay_buffer import ReplayBuffer
+
+# === Fixed sensor defaults (hardcoded) ===
+# Femto depth/pointcloud: millimeters; D405 depth: 0.1mm (RealSense scale)
+FEMTO_DEPTH_W, FEMTO_DEPTH_H = 320, 288
+D405_STRIDE = 1
 
 robot_to_base = np.array([
     [1., 0., 0., -0.04],
@@ -32,1147 +26,663 @@ robot_to_base = np.array([
     [0., 0., 0.,  1.0]
 ])
 
+
+
+def _parse_intrinsics(intr) -> Tuple[float, float, float, float]:
+    """
+    Supports:
+      - dict: {"fx","fy","cx","cy"}
+      - np.ndarray (4,) or (3,3)
+      - object with fx,fy,cx,cy
+    """
+    if intr is None:
+        raise ValueError("intrinsics is None")
+
+    if isinstance(intr, dict):
+        return float(intr["fx"]), float(intr["fy"]), float(intr["cx"]), float(intr["cy"])
+
+    if isinstance(intr, (list, tuple)):
+        intr = np.asarray(intr)
+
+    if isinstance(intr, np.ndarray):
+        if intr.shape == (4,):
+            fx, fy, cx, cy = intr.tolist()
+            return float(fx), float(fy), float(cx), float(cy)
+        if intr.shape == (3, 3):
+            fx = intr[0, 0]; fy = intr[1, 1]
+            cx = intr[0, 2]; cy = intr[1, 2]
+            return float(fx), float(fy), float(cx), float(cy)
+
+    if all(hasattr(intr, k) for k in ("fx", "fy", "cx", "cy")):
+        return float(intr.fx), float(intr.fy), float(intr.cx), float(intr.cy)
+
+    raise ValueError(f"Unsupported intrinsics format: type={type(intr)}")
+
+
+def _femto_depth_to_meters(depth: np.ndarray) -> np.ndarray:
+    return depth.astype(np.float32, copy=False) * 1e-3
+
+
+def _d405_depth_to_meters(depth: np.ndarray) -> np.ndarray:
+    return depth.astype(np.float32, copy=False) * 1e-4
+
+
+def crop_workspace_points(points: np.ndarray, bounds: np.ndarray) -> np.ndarray:
+    """
+    points: (N,3) or (N,6) or (N,7) (앞 3개 xyz)
+    bounds: (3,2)
+    """
+    if points is None or points.size == 0:
+        return points
+    xyz = points[:, :3]
+    m = (
+        (xyz[:, 0] >= bounds[0, 0]) & (xyz[:, 0] <= bounds[0, 1]) &
+        (xyz[:, 1] >= bounds[1, 0]) & (xyz[:, 1] <= bounds[1, 1]) &
+        (xyz[:, 2] >= bounds[2, 0]) & (xyz[:, 2] <= bounds[2, 1])
+    )
+    return points[m]
+
+
+def transform_points(T_4x4: np.ndarray, xyz: np.ndarray) -> np.ndarray:
+    if xyz is None or xyz.size == 0:
+        return xyz
+    xyz = np.asarray(xyz)
+    N = xyz.shape[0]
+    xyz_h = np.c_[xyz, np.ones((N, 1), dtype=np.float64)]
+    out = (T_4x4 @ xyz_h.T).T[:, :3]
+    return out
+
+
+def voxel_keys_from_xyz(xyz: np.ndarray, voxel_size: float) -> np.ndarray:
+    """
+    xyz: (N,3) float
+    return: (N,) np.void keys
+    """
+    if xyz.size == 0:
+        return np.empty((0,), dtype=np.dtype((np.void, 12)))
+    grid = np.floor(xyz / float(voxel_size)).astype(np.int32, copy=False)
+    grid = np.ascontiguousarray(grid)
+    return grid.view(np.dtype((np.void, 12))).ravel()
+
+
+# variance filter + depth threshold
+def depth_variance_filter(
+    depth: np.ndarray,
+    depth_to_meters_fn,
+    ksize: int = 5,
+    std_thresh_m: float = 0.004,   # 4mm 정도부터 시작 추천
+    min_depth_m: float = 0.05,
+    max_depth_m: float = 2.0,
+) -> np.ndarray:
+    """
+    depth image에서 로컬 분산(표준편차) 기반으로 noisy pixel 제거.
+    - 반환은 depth와 동일 dtype 유지(대부분 uint16), 제거 픽셀은 0.
+    - 계산은 meter 단위로 함.
+    """
+    if depth is None:
+        raise ValueError("depth is None")
+    if ksize % 2 == 0:
+        ksize += 1
+
+    depth_m = depth_to_meters_fn(depth)
+    valid = (depth_m > float(min_depth_m)) & (depth_m < float(max_depth_m))
+    if not np.any(valid):
+        out = np.zeros_like(depth)
+        return out
+
+    # invalid는 0으로 두고 boxFilter 수행
+    x = np.where(valid, depth_m, 0.0).astype(np.float32)
+    ones = valid.astype(np.float32)
+
+    # E[x], E[x^2] (valid만 평균)
+    mean_x = cv2.boxFilter(x, ddepth=-1, ksize=(ksize, ksize), normalize=False, borderType=cv2.BORDER_DEFAULT)
+    mean_x2 = cv2.boxFilter(x * x, ddepth=-1, ksize=(ksize, ksize), normalize=False, borderType=cv2.BORDER_DEFAULT)
+    cnt = cv2.boxFilter(ones, ddepth=-1, ksize=(ksize, ksize), normalize=False, borderType=cv2.BORDER_DEFAULT)
+    cnt = np.maximum(cnt, 1.0)
+
+    ex = mean_x / cnt
+    ex2 = mean_x2 / cnt
+    var = np.maximum(ex2 - ex * ex, 0.0)
+    std = np.sqrt(var)
+
+    keep = valid & (std <= float(std_thresh_m))
+    out = np.where(keep, depth, 0).astype(depth.dtype, copy=False)
+    return out
+
+
+def d405_depth_to_pointcloud(
+    depth: np.ndarray,
+    color: Optional[np.ndarray],
+    intrinsics,
+    stride: int = 2,
+) -> np.ndarray:
+    """
+    depth+color -> (N,6) camera frame xyz(m) + rgb(0~1)
+    """
+    if depth is None:
+        return np.zeros((0, 6), dtype=np.float32)
+
+    fx, fy, cx, cy = _parse_intrinsics(intrinsics)
+    # Depth scale is sensor-fixed; ignore provided unit and use defaults
+    # D405 depth is 0.1mm scale (fixed)
+    depth_m = _d405_depth_to_meters(depth)
+
+    H, W = depth_m.shape
+    if color is None:
+        color = np.zeros((H, W, 3), dtype=np.uint8)
+    else:
+        if color.shape[0] != H or color.shape[1] != W:
+            H2 = min(H, color.shape[0])
+            W2 = min(W, color.shape[1])
+            depth_m = depth_m[:H2, :W2]
+            color = color[:H2, :W2]
+            H, W = H2, W2
+
+    v = np.arange(0, H, stride, dtype=np.int32)
+    u = np.arange(0, W, stride, dtype=np.int32)
+    uu, vv = np.meshgrid(u, v)
+    z = depth_m[vv, uu]
+
+    # max_depth_m pruning is already applied upstream in depth_variance_filter
+    valid = (z > 0.0)
+    if not np.any(valid):
+        return np.zeros((0, 6), dtype=np.float32)
+
+    uu = uu[valid].astype(np.float32)
+    vv = vv[valid].astype(np.float32)
+    z = z[valid].astype(np.float32)
+
+    x = (uu - float(cx)) / float(fx) * z
+    y = (vv - float(cy)) / float(fy) * z
+    xyz = np.stack([x, y, z], axis=1).astype(np.float32)
+
+    rgb = color[vv.astype(np.int32), uu.astype(np.int32), :3].astype(np.float32)
+    if rgb.max() > 1.0:
+        rgb = rgb / 255.0
+
+    return np.concatenate([xyz, rgb], axis=1).astype(np.float32, copy=False)
+
+
+def femto_filter_pointcloud_by_depth_mask(
+    femto_points_cam: np.ndarray,     # (N,6) xyz + rgb, Femto camera frame (mm)
+    depth_masked: np.ndarray,         # variance-filter 적용된 depth (0이면 제거)
+    K: np.ndarray,                    # 3x3 intrinsics
+    z_consistency_eps_m: float = 0.01,
+    use_z_consistency: bool = True,
+) -> np.ndarray:
+    """
+    Femto처럼 depth로 PC 재생성이 불가한 경우:
+    - variance-filter된 depth에서 살아남은 픽셀만 유지하도록
+      point cloud를 다시 투영(u,v)해서 매칭 후 제거.
+    """
+    if femto_points_cam is None or femto_points_cam.size == 0:
+        return np.zeros((0, 6), dtype=np.float32)
+    if depth_masked is None:
+        return femto_points_cam.astype(np.float32, copy=False)
+
+    H, W = depth_masked.shape
+    fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+
+    xyz = femto_points_cam[:, :3].astype(np.float32, copy=False)
+
+    # femto pointcloud는 mm 단위로 가정
+    xyz_m = xyz * 1e-3
+
+    z = xyz_m[:, 2]
+    valid_z = z > 1e-6
+    if not np.any(valid_z):
+        return np.zeros((0, 6), dtype=np.float32)
+
+    x = xyz_m[:, 0]
+    y = xyz_m[:, 1]
+    u = np.rint(fx * (x / z) + cx).astype(np.int32)
+    v = np.rint(fy * (y / z) + cy).astype(np.int32)
+
+    inb = valid_z & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    if not np.any(inb):
+        return np.zeros((0, 6), dtype=np.float32)
+
+    idx_inb = np.flatnonzero(inb)
+    u_in = u[inb]
+    v_in = v[inb]
+
+    # depth_masked에서 0이 아닌 픽셀만 keep
+    ok_pix = depth_masked[v_in, u_in] > 0
+    if not np.any(ok_pix):
+        return np.zeros((0, 6), dtype=np.float32)
+
+    keep_mask = np.zeros((femto_points_cam.shape[0],), dtype=bool)
+
+    if use_z_consistency:
+        depth_m = _femto_depth_to_meters(depth_masked)
+        z_pc = z[inb][ok_pix]
+        z_img = depth_m[v_in[ok_pix], u_in[ok_pix]]
+        ok_z = np.abs(z_pc - z_img) <= float(z_consistency_eps_m)
+        keep_mask[idx_inb[ok_pix][ok_z]] = True
+    else:
+        keep_mask[idx_inb[ok_pix]] = True
+
+    return femto_points_cam[keep_mask].astype(np.float32, copy=False)
+
+
+def _project_points_to_pixels(points_cam_xyz_m: np.ndarray, K: np.ndarray, width: int, height: int):
+    """
+    points_cam_xyz_m: (N,3) meters, camera frame
+    return:
+      u,v,z  (all filtered to in-bounds and z>0)
+    """
+    if points_cam_xyz_m is None or points_cam_xyz_m.size == 0:
+        return (np.zeros((0,), dtype=np.int32),
+                np.zeros((0,), dtype=np.int32),
+                np.zeros((0,), dtype=np.float32))
+
+    fx, fy, cx, cy = float(K[0,0]), float(K[1,1]), float(K[0,2]), float(K[1,2])
+    x = points_cam_xyz_m[:, 0].astype(np.float32, copy=False)
+    y = points_cam_xyz_m[:, 1].astype(np.float32, copy=False)
+    z = points_cam_xyz_m[:, 2].astype(np.float32, copy=False)
+
+    valid = z > 1e-6
+    if not np.any(valid):
+        return (np.zeros((0,), dtype=np.int32),
+                np.zeros((0,), dtype=np.int32),
+                np.zeros((0,), dtype=np.float32))
+
+    u = np.rint(fx * (x[valid] / z[valid]) + cx).astype(np.int32)
+    v = np.rint(fy * (y[valid] / z[valid]) + cy).astype(np.int32)
+    z = z[valid]
+
+    inb = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    return u[inb], v[inb], z[inb]
+
+
+@dataclass
+class D405Config:
+    d405_cam_to_eef: np.ndarray                 # (4,4) eef<-cam
+    robot_to_base: np.ndarray                   # (4,4) base<-robot  (너 코드의 ROBOT_TO_BASE)
+    stride: int = D405_STRIDE
+    max_depth_m: float = 0.25                   # can be overridden from YAML
+    var_ksize: int = 5
+    var_std_thresh_m: float = 0.004
+    var_min_depth_m: float = 0.01
+    var_max_depth_m: float = 0.25
+
+
+@dataclass
+class FemtoConfig:
+    K: np.ndarray                               # (3,3)
+    cam_to_base: np.ndarray                     # (4,4) base<-cam
+    width: int = FEMTO_DEPTH_W
+    height: int = FEMTO_DEPTH_H
+    var_ksize: int = 5
+    var_std_thresh_m: float = 0.004
+    var_min_depth_m: float = 0.01
+    var_max_depth_m: float = 1e6
+
+
 class PointCloudPreprocessor:
     """
-    - 기존 단일뷰 PCM(temporal fused) + occlusion prune + variance filter 유지
-    - 멀티뷰(Femto + D405)용 process_global / _occlusion_prune_memory_multiview 추가
-    - depth_u16를 그대로 Z-buffer로 사용(빠름): uint16 erosion(min-filter)로 Zmin 생성
-    - "공격적 삭제"는 free-space carving 기준으로 margin=0이 가장 공격적:
-        delete_free_space: z_mem < (z_now + margin)
-      (margin>0이면 덜 공격적 / noise 허용)
+    목표 파이프라인(요약):
+      - Femto:
+          femto_depth(raw)            -> (occlusion prune용 z-buffer 비교에 사용, depth==0은 unknown)
+          femto_depth_var(variance)   -> femto_points를 재투영해 마스킹 -> current cloud(merge용)
+      - D405:
+          d405_depth(raw)             -> (occlusion prune용 z-buffer 비교에 사용, depth==0 unknown)
+          d405_depth_var(variance)    -> (depth_var + color)로 PC 생성 -> current cloud(merge용)
+
+    메모리 업데이트:
+      memory(t) = prune(memory(t-1), current_raw_depths)  # free-space carve (raw depth 기반)
+      memory(t) = voxel_merge(memory(t), current_points)  # current가 voxel 우선
+      confidence c는 memory에만 decay, current는 c=1
     """
 
-    # ----------------------------
-    # Orbbec intr/dist helper
-    # ----------------------------
-    @staticmethod
-    def _is_orbbec_intrinsics(obj) -> bool:
-        return all(hasattr(obj, a) for a in ("fx", "fy", "cx", "cy"))
-
-    @staticmethod
-    def _is_orbbec_distortion(obj) -> bool:
-        return all(hasattr(obj, a) for a in ("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2"))
-
-    @staticmethod
-    def _as_cv_K_from_orbbec_intrinsics(orbbec_intr):
-        K = np.array([[float(orbbec_intr.fx), 0.0, float(orbbec_intr.cx)],
-                      [0.0, float(orbbec_intr.fy), float(orbbec_intr.cy)],
-                      [0.0, 0.0, 1.0]], dtype=np.float64)
-        return K
-
-    @staticmethod
-    def _as_cv_dist_from_orbbec_distortion(orbbec_dist):
-        # Orbbec(k1..k6, p1, p2) → OpenCV rational 8계수 [k1,k2,p1,p2,k3,k4,k5,k6]
-        k1 = float(orbbec_dist.k1); k2 = float(orbbec_dist.k2); k3 = float(orbbec_dist.k3)
-        k4 = float(orbbec_dist.k4); k5 = float(orbbec_dist.k5); k6 = float(orbbec_dist.k6)
-        p1 = float(orbbec_dist.p1); p2 = float(orbbec_dist.p2)
-        return np.array([k1, k2, p1, p2, k3, k4, k5, k6], dtype=np.float64)
-
-    @staticmethod
-    def convert_orbbec_depth_params(depth_intrinsics, depth_distortion):
-        K = PointCloudPreprocessor._as_cv_K_from_orbbec_intrinsics(depth_intrinsics)
-        dist = PointCloudPreprocessor._as_cv_dist_from_orbbec_distortion(depth_distortion)
-        return K, dist
-
-    @staticmethod
-    def _depth_u16_to_m(depth_u16: np.ndarray, z_unit: str) -> np.ndarray:
-        """uint16 depth -> meters(float32). 0은 invalid로 유지."""
-        d = depth_u16.astype(np.float32, copy=False)
-        z_unit = str(z_unit).lower()
-        if z_unit == "m":
-            return d
-        if z_unit == "mm":
-            return d * 1e-3
-        if z_unit in ("0.1mm", "0_1mm", "1e-4"):
-            return d * 1e-4
-        raise ValueError(f"Unknown z_unit={z_unit}")
-    
-    @staticmethod
-    def _gather_zbuf_np(zbuf_m: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        """
-        zbuf_m: (H,W) float32 meters, invalid=0
-        u,v: (N,) int32 pixel coords
-        return z_now: (N,) float32 meters (0 if out-of-bounds or invalid)
-        """
-        z_now = np.zeros((u.shape[0],), dtype=np.float32)
-        if u.size == 0:
-            return z_now
-
-        H, W = zbuf_m.shape[:2]
-        inb = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-        if np.any(inb):
-            z_now[inb] = zbuf_m[v[inb], u[inb]]
-        return z_now
-
-    # ----------------------------
-    # ctor
-    # ----------------------------
     def __init__(
         self,
-        enable_sampling=False,
-        target_num_points=1024,
-        enable_transform=True,
-        extrinsics_matrix=None,
-        enable_cropping=True,
-        workspace_bounds=None,
-        enable_wrist_camera=True,
-        # Variance filter
-        enable_filter=False,
-        variance_kernel_size=5,
-        variance_threshold=50,
-        # Open3D Outlier filter (legacy)
-        nb_points=10,
-        sor_std=1.7,
-        use_cuda=True,
-        verbose=False,
-        # PCM temporal
-        enable_temporal=False,
-        export_mode='off',
-        temporal_voxel_size=0.005,
-        temporal_decay=0.96,
-        temporal_c_min=0.20,
-        temporal_prune_every: int = 1,
-        stable_export: bool = False,
-        # Occlusion prune
-        enable_occlusion_prune: bool = True,
-        depth_width: Optional[int] = 320,
-        depth_height: Optional[int] = 288,
-        K_depth: Optional[Sequence[Sequence[float]]] = None,
-        dist_depth: Optional[Sequence[float]] = None,
-        depth_rectified: bool = True,          # ✅ (기본) 왜곡 보정된 depth로 가정
-        erode_k: int = 1,
-        z_unit: str = 'm',                     # 'm' / 'mm' / '0.1mm'
-        occl_patch_radius: int = 2,
-        # miss-prune
-        miss_prune_frames: int = 20,
-        miss_min_age: int = 2,
-        # free-space delete margin (meters)
-        free_space_margin_m: float = 0.009,      # ✅ 공격적으로: 0.0  (값↑ => 덜 삭제)
+        workspace_bounds: np.ndarray,
+        femto: Optional[FemtoConfig] = None,
+        d405: Optional[D405Config] = None,
+        sensor_mode: str = "both",                # "femto"|"d405"|"both"
+        enable_temporal: bool = True,
+        enable_TF: bool = True,                   # cam->base transform
+        enable_crop: bool = True,                 # workspace crop
+        enable_filter: bool = True,               # variance filter
+        temporal_voxel_size: float = 0.005,
+        temporal_decay: float = 0.95,
+        c_min: float = 0.1,
+        free_space_margin_m: float = 0.009,
+        verbose: bool = False,
     ):
-        # extrinsics (Femto cam_to_base or similar) default
-        if extrinsics_matrix is None:
-            self.extrinsics_matrix = np.array([
-                [0.007131, -0.91491,  0.403594, 0.05116],
-                [-0.994138, 0.003833, 0.02656, -0.00918],
-                [-0.025717, -0.403641, -0.914552, 0.50821],
-                [0., 0., 0., 1.]
-            ], dtype=np.float64)
-        else:
-            self.extrinsics_matrix = np.array(extrinsics_matrix, dtype=np.float64)
-
-        # workspace bounds
-        if workspace_bounds is None:
-            self.workspace_bounds = [
-                [0.132, 0.715],
-                [-0.400, 0.350],
-                [-0.100, 0.400]
-            ]
-        else:
-            self.workspace_bounds = workspace_bounds
-
-        # K_depth
-        if K_depth is None:
-            self._K_depth = np.array([
-                [252.69204711914062, 0.0, 166.12030029296875],
-                [0.0, 252.65277099609375, 176.21173095703125],
-                [0.0, 0.0, 1.0]
-            ], dtype=np.float64)
-        else:
-            if self._is_orbbec_intrinsics(K_depth):
-                self._K_depth = self._as_cv_K_from_orbbec_intrinsics(K_depth)
-            else:
-                self._K_depth = np.array(K_depth, dtype=np.float64)
-        assert self._K_depth.shape == (3, 3), f"K_depth must be 3x3, got {self._K_depth.shape}"
-
-        # dist_depth (rectified면 None로 두는게 맞음)
-        self.depth_rectified = bool(depth_rectified)
-        if self.depth_rectified:
-            self._dist_depth = None
-        else:
-            if dist_depth is None:
-                self._dist_depth = np.array(
-                    [11.690222, 5.343991, 0.000065, 0.000014, 0.172997, 12.017323, 9.254467, 1.165690],
-                    dtype=np.float64
-                )
-            else:
-                if self._is_orbbec_distortion(dist_depth):
-                    self._dist_depth = self._as_cv_dist_from_orbbec_distortion(dist_depth)
-                else:
-                    self._dist_depth = np.asarray(dist_depth, dtype=np.float64)
-                    if self._dist_depth.size not in (4, 5, 8):
-                        raise ValueError(f"dist_depth must have 4/5/8 coeffs, got {self._dist_depth.size}")
-
-        # basic flags
-        self.target_num_points = int(target_num_points)
-        self.nb_points = int(nb_points)
-        self.sor_std = float(sor_std)
-        self.enable_transform = bool(enable_transform)
-        self.enable_cropping = bool(enable_cropping)
-        self.enable_sampling = bool(enable_sampling)
-        self.enable_wrist_camera = bool(enable_wrist_camera)
+        self.workspace_bounds = workspace_bounds.astype(np.float64)
+        self.femto = femto
+        self.d405 = d405
+        assert sensor_mode in ("femto", "d405", "both")
+        self.sensor_mode = sensor_mode
+        self.enable_TF = bool(enable_TF)
+        self.enable_crop = bool(enable_crop)
         self.enable_filter = bool(enable_filter)
-        self.variance_kernel_size = int(variance_kernel_size)
-        self.variance_threshold = float(variance_threshold)
 
-        self.use_cuda = bool(use_cuda and torch.cuda.is_available())
+        self.enable_temporal = bool(enable_temporal)
+        self.temporal_voxel_size = float(temporal_voxel_size)
+        self.temporal_decay = float(temporal_decay)
+        self.c_min = float(c_min)
+        self.free_space_margin_m = float(free_space_margin_m)
         self.verbose = bool(verbose)
 
-        # temporal
-        self.enable_temporal = bool(enable_temporal)
-        self.export_mode = str(export_mode)
-        self._temporal_voxel_size = float(temporal_voxel_size)
-        self._temporal_decay = float(temporal_decay)
-        self._temporal_c_min = float(temporal_c_min)
-        self._prune_every = int(max(1, temporal_prune_every))
-        self._stable_export = bool(stable_export)
+        # memory: (M,7) xyz rgb c  in BASE frame
+        self._memory = np.zeros((0, 7), dtype=np.float32)
 
-        # occlusion prune params
-        self.enable_occlusion_prune = bool(enable_occlusion_prune)
-        self._depth_w = int(depth_width)
-        self._depth_h = int(depth_height)
-        self._erode_k = int(erode_k)
-        self._z_unit = str(z_unit)
-        self.occl_patch_radius = int(occl_patch_radius)
-        self._free_space_margin_m = float(free_space_margin_m)
+        # cached inverses
+        self._base_to_femto = None
+        if self.femto is not None:
+            self._base_to_femto = np.linalg.inv(self.femto.cam_to_base).astype(np.float64)
 
-        self._miss_prune_frames = int(miss_prune_frames)
-        self._miss_min_age = int(miss_min_age)
-
-        # base->cam for Femto (invert extrinsics_matrix)
-        self._base_to_cam = None
-        if self.enable_occlusion_prune or self.enable_filter:
-            self._base_to_cam = np.linalg.inv(self.extrinsics_matrix).astype(np.float64)
-
-        # temporal memory buffers
-        self._frame_idx = 0
-        self._mem_keys = np.empty((0,), dtype=np.dtype((np.void, 12)))
-        self._mem_xyz = np.empty((0, 3), dtype=np.float32)
-        self._mem_rgb = np.empty((0, 3), dtype=np.float32)
-        self._mem_step = np.empty((0,), dtype=np.int32)
-        self._mem_miss = np.empty((0,), dtype=np.int16)
-
-        # Femto cached projection
-        self._mem_u = np.empty((0,), dtype=np.int32)
-        self._mem_v = np.empty((0,), dtype=np.int32)
-        self._mem_zcam = np.empty((0,), dtype=np.float32)
-
-        # age threshold from temporal decay
-        if 0.0 < self._temporal_decay < 1.0 and 0.0 < self._temporal_c_min < 1.0:
-            self._max_age_steps = int(np.floor(np.log(self._temporal_c_min) / np.log(self._temporal_decay)))
-        else:
-            self._max_age_steps = 0
-
-        # torch init
-        self._device = None
-        self._K_depth_t = None
-        self._dist_depth_t = None
-        self._base_to_cam_t = None
-
-        # cache for pinhole(K_d405)
-        self._K_pinhole_cache_key = None
-        self._K_pinhole_cache_t = None
-
-        if (self.enable_temporal and self.export_mode == 'fused') or self.enable_occlusion_prune or self.enable_filter:
-            if not self.use_cuda:
-                raise RuntimeError(
-                    "GPU-only path enabled (temporal fused / occlusion prune / variance filter). "
-                    "Set use_cuda=True and ensure CUDA is available."
-                )
-            self._maybe_init_torch_camera()
-
-        if self.verbose:
-            print("PointCloudPreprocessor initialized")
-            print(f"  - temporal: {self.enable_temporal}, export_mode: {self.export_mode}")
-            print(f"  - occlusion_prune: {self.enable_occlusion_prune}, free_space_margin_m: {self._free_space_margin_m}")
-            print(f"  - depth_rectified: {self.depth_rectified}")
-            print(f"  - CUDA: {self.use_cuda}")
-
-    def __call__(self, points):
-        return self.process(points)
-
-    # ----------------------------
-    # torch init / camera model (Femto)
-    # ----------------------------
-    def _maybe_init_torch_camera(self):
-        if not self.use_cuda:
-            return
-        dev = torch.device("cuda")
-        self._device = dev
-
-        self._K_depth_t = torch.tensor(self._K_depth, dtype=torch.float32, device=dev)
-
-        if self._dist_depth is None:
-            dist8 = np.zeros(8, dtype=np.float64)
-        else:
-            d = self._dist_depth
-            if d.size == 4:
-                dist8 = np.array([d[0], d[1], d[2], d[3], 0, 0, 0, 0], dtype=np.float64)
-            elif d.size == 5:
-                dist8 = np.array([d[0], d[1], d[2], d[3], d[4], 0, 0, 0], dtype=np.float64)
-            elif d.size == 8:
-                dist8 = d.astype(np.float64, copy=False)
-            else:
-                dist8 = np.zeros(8, dtype=np.float64)
-        self._dist_depth_t = torch.tensor(dist8, dtype=torch.float32, device=dev)
-
-        if self._base_to_cam is not None:
-            self._base_to_cam_t = torch.tensor(self._base_to_cam.astype(np.float32), device=dev)
-
-    def _opencv_rational_distort_torch(self, xn: torch.Tensor, yn: torch.Tensor):
-        k = self._dist_depth_t  # [k1,k2,p1,p2,k3,k4,k5,k6]
-        k1, k2, p1, p2, k3, k4, k5, k6 = k
-        r2 = xn * xn + yn * yn
-        r4 = r2 * r2
-        r6 = r4 * r2
-        radial = (1 + k1 * r2 + k2 * r4 + k3 * r6) / (1 + k4 * r2 + k5 * r4 + k6 * r6)
-        x_tan = 2 * p1 * xn * yn + p2 * (r2 + 2 * xn * xn)
-        y_tan = p1 * (r2 + 2 * yn * yn) + 2 * p2 * xn * yn
-        xd = xn * radial + x_tan
-        yd = yn * radial + y_tan
-        return xd, yd
-
-    def _project_points_cam_torch(self, xyz_cam_t: torch.Tensor):
-        if xyz_cam_t.numel() == 0:
-            empty_i32 = np.array([], dtype=np.int32)
-            empty_f64 = np.array([], dtype=np.float64)
-            empty_i64 = np.array([], dtype=np.int64)
-            return empty_i32, empty_i32, empty_f64, empty_i64
-
-        z = xyz_cam_t[:, 2]
-        valid = z > 0.0
-        if torch.count_nonzero(valid) == 0:
-            empty_i32 = np.array([], dtype=np.int32)
-            empty_f64 = np.array([], dtype=np.float64)
-            empty_i64 = np.array([], dtype=np.int64)
-            return empty_i32, empty_i32, empty_f64, empty_i64
-
-        pts = xyz_cam_t[valid]
-        xn = pts[:, 0] / pts[:, 2]
-        yn = pts[:, 1] / pts[:, 2]
-
-        # rectified면 왜곡 없음
-        if self._dist_depth is None:
-            xd, yd = xn, yn
-        else:
-            xd, yd = self._opencv_rational_distort_torch(xn, yn)
-
-        fx = self._K_depth_t[0, 0]; fy = self._K_depth_t[1, 1]
-        cx = self._K_depth_t[0, 2]; cy = self._K_depth_t[1, 2]
-
-        u = torch.round(fx * xd + cx).to(torch.int32)
-        v = torch.round(fy * yd + cy).to(torch.int32)
-
-        inb = (u >= 0) & (u < int(self._depth_w)) & (v >= 0) & (v < int(self._depth_h))
-        if torch.count_nonzero(inb) == 0:
-            empty_i32 = np.array([], dtype=np.int32)
-            empty_f64 = np.array([], dtype=np.float64)
-            empty_i64 = np.array([], dtype=np.int64)
-            return empty_i32, empty_i32, empty_f64, empty_i64
-
-        u = u[inb]
-        v = v[inb]
-        z_out = pts[inb, 2]
-
-        orig_idx = torch.nonzero(valid, as_tuple=False).squeeze(1)[inb]
-        return (
-            u.detach().cpu().numpy(),
-            v.detach().cpu().numpy(),
-            z_out.detach().cpu().numpy().astype(np.float64),
-            orig_idx.detach().cpu().numpy().astype(np.int64),
-        )
-
-    def _project_base_to_cam_torch(self, xyz_base_np: np.ndarray):
-        if xyz_base_np.size == 0:
-            empty_i32 = np.array([], dtype=np.int32)
-            empty_f64 = np.array([], dtype=np.float64)
-            empty_i64 = np.array([], dtype=np.int64)
-            return empty_i32, empty_i32, empty_f64, empty_i64
-
-        self._maybe_init_torch_camera()
-        assert self._base_to_cam_t is not None, "Base→Cam not initialized"
-
-        xyz = torch.from_numpy(xyz_base_np.astype(np.float32, copy=False)).to(self._device)
-        ones = torch.ones((xyz.shape[0], 1), dtype=torch.float32, device=self._device)
-        xyz1 = torch.cat([xyz, ones], dim=1)
-        xyz_cam = (xyz1 @ self._base_to_cam_t.T)[:, :3]
-        return self._project_points_cam_torch(xyz_cam)
-
-    # ----------------------------
-    # temporal memory core
-    # ----------------------------
     def reset_temporal(self):
-        self._frame_idx = 0
-        self._mem_keys = np.empty((0,), dtype=np.dtype((np.void, 12)))
-        self._mem_xyz = np.empty((0, 3), dtype=np.float32)
-        self._mem_rgb = np.empty((0, 3), dtype=np.float32)
-        self._mem_step = np.empty((0,), dtype=np.int32)
-        self._mem_miss = np.empty((0,), dtype=np.int16)
-        self._mem_u = np.empty((0,), dtype=np.int32)
-        self._mem_v = np.empty((0,), dtype=np.int32)
-        self._mem_zcam = np.empty((0,), dtype=np.float32)
+        self._memory = np.zeros((0, 7), dtype=np.float32)
 
-    def voxel_keys_from_xyz(self, xyz: np.ndarray):
-        grid = np.floor(xyz / self._temporal_voxel_size).astype(np.int32, copy=False)
-        grid = np.ascontiguousarray(grid)
-        keys = grid.view(np.dtype((np.void, 12))).ravel()
-        return keys
-
-    def _frame_unique_torch(self, xyz_np: np.ndarray, rgb_np: np.ndarray, last_wins: bool = False):
-        if xyz_np.shape[0] == 0:
-            empty_keys = np.empty((0,), dtype=np.dtype((np.void, 12)))
-            return xyz_np, rgb_np, empty_keys
-
-        device = torch.device("cuda")
-        xyz_t = torch.from_numpy(xyz_np.astype(np.float32, copy=False)).to(device)
-        grid_t = torch.floor(xyz_t / float(self._temporal_voxel_size)).to(torch.int32)
-
-        uniq, inv = torch.unique(grid_t, dim=0, return_inverse=True)
-        idx_all = torch.arange(grid_t.shape[0], device=device, dtype=torch.int64)
-
-        if last_wins:
-            idx_sel = torch.zeros(uniq.shape[0], dtype=torch.int64, device=device)
-            idx_sel.scatter_reduce_(0, inv, idx_all, reduce='amax', include_self=False)
-        else:
-            big = torch.iinfo(torch.int64).max
-            idx_sel = torch.full((uniq.shape[0],), big, dtype=torch.int64, device=device)
-            idx_sel.scatter_reduce_(0, inv, idx_all, reduce='amin', include_self=True)
-
-        idx_np = idx_sel.detach().cpu().numpy().astype(np.int64)
-        xyz_unique = xyz_np[idx_np]
-        rgb_unique = rgb_np[idx_np]
-
-        grid_sel = uniq.detach().cpu().numpy().astype(np.int32)
-        keys_new = np.ascontiguousarray(grid_sel).view(np.dtype((np.void, 12))).ravel()
-        return xyz_unique, rgb_unique, keys_new
-
-    def _merge_into_mem(self, xyz_new: np.ndarray, rgb_new: np.ndarray, now_step: int,
-                        keys_new: Optional[np.ndarray] = None):
-        if xyz_new.shape[0] == 0:
-            return
-        if keys_new is None:
-            keys_new = self.voxel_keys_from_xyz(xyz_new)
-
-        if self._mem_keys.size == 0:
-            self._mem_keys = keys_new.copy()
-            self._mem_xyz = xyz_new.astype(np.float32, copy=False).copy()
-            self._mem_rgb = rgb_new.astype(np.float32, copy=False).copy()
-            self._mem_step = np.full((xyz_new.shape[0],), now_step, dtype=np.int32)
-            self._mem_miss = np.zeros((xyz_new.shape[0],), dtype=np.int16)
-            if self.enable_occlusion_prune:
-                u_add, v_add, z_add = self._project_and_pack(self._mem_xyz)
-                self._mem_u, self._mem_v, self._mem_zcam = u_add, v_add, z_add
-            return
-
-        common, idx_mem, idx_new = np.intersect1d(self._mem_keys, keys_new, return_indices=True)
-        if common.size > 0:
-            self._mem_xyz[idx_mem] = xyz_new[idx_new]
-            self._mem_rgb[idx_mem] = rgb_new[idx_new]
-            self._mem_step[idx_mem] = now_step
-            self._mem_miss[idx_mem] = 0
-            if self.enable_occlusion_prune:
-                u_upd, v_upd, z_upd = self._project_and_pack(xyz_new[idx_new])
-                self._mem_u[idx_mem] = u_upd
-                self._mem_v[idx_mem] = v_upd
-                self._mem_zcam[idx_mem] = z_upd
-
-        mask_new_only = np.ones(keys_new.shape[0], dtype=bool)
-        if common.size > 0:
-            mask_new_only[idx_new] = False
-
-        if mask_new_only.any():
-            add_xyz = xyz_new[mask_new_only]
-            add_rgb = rgb_new[mask_new_only]
-            add_keys = keys_new[mask_new_only]
-
-            self._mem_keys = np.concatenate([self._mem_keys, add_keys], axis=0)
-            self._mem_xyz = np.concatenate([self._mem_xyz, add_xyz], axis=0)
-            self._mem_rgb = np.concatenate([self._mem_rgb, add_rgb], axis=0)
-            self._mem_step = np.concatenate(
-                [self._mem_step, np.full((add_xyz.shape[0],), now_step, dtype=np.int32)], axis=0
-            )
-            self._mem_miss = np.concatenate(
-                [self._mem_miss, np.zeros((add_xyz.shape[0],), dtype=np.int16)], axis=0
-            )
-            if self.enable_occlusion_prune:
-                u_add, v_add, z_add = self._project_and_pack(add_xyz)
-                self._mem_u = np.concatenate([self._mem_u, u_add], axis=0)
-                self._mem_v = np.concatenate([self._mem_v, v_add], axis=0)
-                self._mem_zcam = np.concatenate([self._mem_zcam, z_add], axis=0)
-
-    def _prune_mem(self, now_step: int):
-        if self._mem_keys.size == 0:
-            return
-        if (now_step % self._prune_every) != 0:
-            return
-        age = now_step - self._mem_step
-        keep = (age <= self._max_age_steps)
-        if not np.all(keep):
-            self._delete_mask(keep)
-
-    def _export_array_from_mem(self, now_step: int) -> np.ndarray:
-        N = self._mem_keys.size
-        if N == 0:
-            return np.zeros((0, 7), dtype=np.float32)
-        age = (now_step - self._mem_step).astype(np.float32)
-        c = (self._temporal_decay ** age).astype(np.float32, copy=False)
-
-        if self._stable_export:
-            order = np.argsort(self._mem_keys)
-            xyz = self._mem_xyz[order]
-            rgb = self._mem_rgb[order]
-            c = c[order]
-        else:
-            xyz = self._mem_xyz
-            rgb = self._mem_rgb
-
-        return np.concatenate([xyz, rgb, c[:, None]], axis=1).astype(np.float32, copy=False)
-
-    # ----------------------------
-    # rasterize / min filter (GPU)
-    # ----------------------------
-    def _rasterize_min_float_torch(self, u: np.ndarray, v: np.ndarray, z_m: np.ndarray, H: int, W: int):
-        assert self.use_cuda
-        if u.size == 0:
-            return np.zeros((H, W), dtype=np.float32)
-
-        device = self._device
-        pix = torch.from_numpy((v * W + u).astype(np.int64)).to(device, non_blocking=True)
-        zt = torch.from_numpy(z_m.astype(np.float32, copy=False)).to(device, non_blocking=True)
-
-        Z = torch.full((H * W,), float("inf"), device=device, dtype=torch.float32)
-        try:
-            Z = torch.scatter_reduce(Z, 0, pix, zt, reduce='amin', include_self=True)
-        except TypeError:
-            Z.scatter_reduce_(0, pix, zt, reduce='amin', include_self=True)
-
-        Z = Z.view(H, W)
-        Z[torch.isinf(Z)] = 0.0
-        return Z.detach().cpu().numpy()
-
-    def _min_filter2d_float_torch(self, Z: np.ndarray, k: int):
-        assert self.use_cuda
-        if k <= 1:
-            return Z
-        import torch.nn.functional as F
-
-        device = self._device
-        Zt = torch.from_numpy(Z.astype(np.float32, copy=False)).to(device, non_blocking=True)
-        sent = torch.tensor(1e6, device=device, dtype=torch.float32)
-        Zt = torch.where(Zt <= 0.0, sent, Zt)
-
-        pad = k // 2
-        Zn = (-Zt).view(1, 1, *Zt.shape)
-        Zn = F.pad(Zn, (pad, pad, pad, pad), mode='replicate')
-        Zmax = F.max_pool2d(Zn, kernel_size=k, stride=1, padding=0)
-        Zmin = (-Zmax).squeeze(0).squeeze(0)
-
-        Zmin = torch.where(Zmin >= sent * 0.999, torch.tensor(0.0, device=device), Zmin)
-        return Zmin.detach().cpu().numpy()
-
-    # ----------------------------
-    # depth-u16 min filter (CPU, fast) : ignore 0
-    # ----------------------------
-    def _min_filter_u16_ignore0(self, depth_u16: np.ndarray, k: int) -> np.ndarray:
+    # --- (optional) old-style process for a single femto pointcloud ---
+    def __call__(self, points: np.ndarray) -> np.ndarray:
         """
-        uint16 depth에 대해 min-filter(erosion) 수행.
-        0은 invalid이므로 sentinel(65535)로 바꿨다가 복원.
+        기존 코드 호환용: femto point cloud만 base로 변환 + workspace crop.
+        (요구사항: point cloud filter는 사용 안 함)
         """
-        if k <= 1:
-            return depth_u16
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
-        tmp = depth_u16.copy()
-        zero = (tmp == 0)
-        tmp[zero] = 65535
-        tmp = cv2.erode(tmp, kernel)
-        tmp[zero] = 0
-        return tmp
-
-    def _zmin_from_depth_u16(self, depth_u16: np.ndarray, *, z_unit: str, patch_radius: int) -> Optional[np.ndarray]:
-        """
-        depth_u16 -> Zmin(meters, float32)
-        - (옵션) erode_k: 센서 노이즈/홀 메움용 min
-        - (필수) patch_radius: occlusion_patch용 Zmin
-        """
-        if depth_u16 is None:
-            return None
-        if depth_u16.ndim != 2:
-            raise ValueError(f"depth_u16 must be HxW, got {depth_u16.shape}")
-
-        d = depth_u16
-        if self._erode_k > 0:
-            k0 = 2 * self._erode_k + 1
-            d = self._min_filter_u16_ignore0(d, k0)
-
-        if patch_radius > 0:
-            k1 = 2 * int(patch_radius) + 1
-            d = self._min_filter_u16_ignore0(d, k1)
-
-        Z = self._depth_u16_to_m(d, z_unit=z_unit)  # meters float32
-        return Z
-
-    # ----------------------------
-    # pack / delete
-    # ----------------------------
-    def _project_and_pack(self, xyz_base: np.ndarray):
-        assert self.use_cuda
-        n = xyz_base.shape[0]
-        u_arr = np.full((n,), -1, dtype=np.int32)
-        v_arr = np.full((n,), -1, dtype=np.int32)
-        z_arr = np.zeros((n,), dtype=np.float32)
-
-        u, v, z, in_idx = self._project_base_to_cam_torch(xyz_base)
-        if in_idx.size > 0:
-            u_arr[in_idx] = u
-            v_arr[in_idx] = v
-            z_arr[in_idx] = z.astype(np.float32, copy=False)
-        return u_arr, v_arr, z_arr
-
-    def _delete_mask(self, keep_mask: np.ndarray):
-        self._mem_keys = self._mem_keys[keep_mask]
-        self._mem_xyz = self._mem_xyz[keep_mask]
-        self._mem_rgb = self._mem_rgb[keep_mask]
-        self._mem_step = self._mem_step[keep_mask]
-        self._mem_miss = self._mem_miss[keep_mask]
-        if self.enable_occlusion_prune:
-            self._mem_u = self._mem_u[keep_mask]
-            self._mem_v = self._mem_v[keep_mask]
-            self._mem_zcam = self._mem_zcam[keep_mask]
-
-    # ----------------------------
-    # single-view occlusion prune (Femto)
-    # ----------------------------
-    def _occlusion_prune_memory_fast(self, now_xyz_base: np.ndarray):
-        """
-        Free-space carving:
-            delete if z_mem < (z_now - margin)
-        margin=0 => 가장 공격적(조금이라도 앞이면 삭제)
-        """
-        assert self.use_cuda
-        if (not self.enable_occlusion_prune) or self._mem_keys.size == 0:
-            return
-        if now_xyz_base.size == 0:
-            return
-
-        u_now, v_now, z_now, _ = self._project_base_to_cam_torch(now_xyz_base)
-        if u_now.size == 0:
-            if self._mem_miss.size > 0:
-                self._mem_miss = np.minimum(self._mem_miss + 1, np.int16(32767))
-            return
-
-        Z_full = self._rasterize_min_float_torch(u_now, v_now, z_now, self._depth_h, self._depth_w)
-
-        k = 2 * self.occl_patch_radius + 1 if self.occl_patch_radius > 0 else 1
-        Z_min = self._min_filter2d_float_torch(Z_full, k)
-
-        valid_mem = (self._mem_u >= 0) & (self._mem_v >= 0) & (self._mem_zcam > 0.0)
-        if not np.any(valid_mem):
-            if self._mem_miss.size > 0:
-                self._mem_miss = np.minimum(self._mem_miss + 1, np.int16(32767))
-            return
-
-        u_m = self._mem_u[valid_mem]
-        v_m = self._mem_v[valid_mem]
-        z_m = self._mem_zcam[valid_mem]          # meters
-        z_now_at = Z_min[v_m, u_m].astype(np.float32, copy=False)
-
-        # delete free-space (aggressive when margin=0)
-        thr = z_now_at + float(self._free_space_margin_m)
-        del_local_valid = (z_now_at > 0.0) & (z_m < thr)
-
-        del_local_mask = np.zeros_like(valid_mem, dtype=bool)
-        del_local_mask[np.where(valid_mem)[0][del_local_valid]] = True
-
-        # miss update (hit if that pixel has current surface)
-        hit_mask_global = np.zeros_like(valid_mem, dtype=bool)
-        hit_mask_global[np.where(valid_mem)[0][z_now_at > 0.0]] = True
-        self._mem_miss[hit_mask_global] = 0
-        self._mem_miss[~hit_mask_global] = np.minimum(self._mem_miss[~hit_mask_global] + 1, np.int16(32767))
-
-        age_all = (self._frame_idx - self._mem_step)
-        del_by_miss = (self._mem_miss >= self._miss_prune_frames) & (age_all >= self._miss_min_age)
-
-        if np.any(del_local_mask) or np.any(del_by_miss):
-            keep_global = ~(del_local_mask | del_by_miss)
-            self._delete_mask(keep_global)
-
-    # ----------------------------
-    # multiview helpers (D405 pinhole)
-    # ----------------------------
-    def _get_K_pinhole_torch(self, K_3x3: np.ndarray) -> torch.Tensor:
-        """K_d405는 보통 고정이므로 torch 텐서 캐시."""
-        K = np.asarray(K_3x3, dtype=np.float32)
-        if K.shape != (3, 3):
-            raise ValueError(f"K_3x3 must be (3,3), got {K.shape}")
-        key = (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2]))
-        if self._K_pinhole_cache_key != key:
-            self._K_pinhole_cache_key = key
-            self._K_pinhole_cache_t = torch.from_numpy(K).to(self._device)
-        return self._K_pinhole_cache_t
-
-    def _project_base_to_cam_pinhole_torch(
-        self,
-        xyz_base_np: np.ndarray,
-        base_to_cam_4x4: np.ndarray,
-        K_3x3: np.ndarray,
-        W: int,
-        H: int,
-    ):
-        """
-        rectified 가정(왜곡 없음).
-        returns: u(int32), v(int32), z(float32 meters), orig_idx(int64)
-        """
-        if xyz_base_np.size == 0:
-            empty_i32 = np.array([], dtype=np.int32)
-            empty_f32 = np.array([], dtype=np.float32)
-            empty_i64 = np.array([], dtype=np.int64)
-            return empty_i32, empty_i32, empty_f32, empty_i64
-
-        assert self.use_cuda
-        dev = self._device
-
-        xyz = torch.from_numpy(xyz_base_np.astype(np.float32, copy=False)).to(dev)
-        ones = torch.ones((xyz.shape[0], 1), dtype=torch.float32, device=dev)
-        xyz1 = torch.cat([xyz, ones], dim=1)
-
-        T = torch.from_numpy(np.asarray(base_to_cam_4x4, dtype=np.float32)).to(dev)
-        xyz_cam = (xyz1 @ T.T)[:, :3]
-
-        z = xyz_cam[:, 2]
-        valid = z > 0.0
-        if torch.count_nonzero(valid) == 0:
-            empty_i32 = np.array([], dtype=np.int32)
-            empty_f32 = np.array([], dtype=np.float32)
-            empty_i64 = np.array([], dtype=np.int64)
-            return empty_i32, empty_i32, empty_f32, empty_i64
-
-        pts = xyz_cam[valid]
-        xn = pts[:, 0] / pts[:, 2]
-        yn = pts[:, 1] / pts[:, 2]
-
-        Kt = self._get_K_pinhole_torch(K_3x3)
-        fx, fy = Kt[0, 0], Kt[1, 1]
-        cx, cy = Kt[0, 2], Kt[1, 2]
-
-        u = torch.round(fx * xn + cx).to(torch.int32)
-        v = torch.round(fy * yn + cy).to(torch.int32)
-
-        inb = (u >= 0) & (u < int(W)) & (v >= 0) & (v < int(H))
-        if torch.count_nonzero(inb) == 0:
-            empty_i32 = np.array([], dtype=np.int32)
-            empty_f32 = np.array([], dtype=np.float32)
-            empty_i64 = np.array([], dtype=np.int64)
-            return empty_i32, empty_i32, empty_f32, empty_i64
-
-        u = u[inb]
-        v = v[inb]
-        z_out = pts[inb, 2].to(torch.float32)
-        orig_idx = torch.nonzero(valid, as_tuple=False).squeeze(1)[inb]
-
-        return (
-            u.detach().cpu().numpy(),
-            v.detach().cpu().numpy(),
-            z_out.detach().cpu().numpy(),
-            orig_idx.detach().cpu().numpy().astype(np.int64),
-        )
-
-    def _occlusion_prune_memory_multiview(
-        self,
-        mem_xyz_base,
-        femto_depth_u16,
-        femto_z_unit: str,
-        d405_depth_u16=None,
-        d405_z_unit: str = "mm",
-        d405_cam_to_base=None,
-        K_d405=None,
-        d405_wh=None,
-    ):
-        """
-        멀티뷰 free-space carving (memory prune).
-
-        핵심 변경점 (Femto):
-          - mem_xyz를 매 프레임 _project_base_to_cam_torch()로 재투영하지 않고,
-            이미 메모리에 캐시된 self._mem_u, self._mem_v, self._mem_zcam을 재사용.
-
-        반환값(기존 호환):
-          - delete_mask: (Nm,) bool
-            True면 메모리에서 삭제할 포인트.
-          *주의*: 기존 코드가 (delete_mask, hit_mask) 형태를 반환하던 구조라면,
-            아래 하단의 "HIT MASK" 섹션을 켜고 process_global 쪽도 맞춰야 합니다.
-        """
-        # ---- normalize inputs ----
-        if isinstance(mem_xyz_base, torch.Tensor):
-            mem_xyz_base = mem_xyz_base.detach().cpu().numpy()
-        mem_xyz_base = np.asarray(mem_xyz_base, dtype=np.float32)
-        Nm = int(mem_xyz_base.shape[0])
-        if Nm == 0:
-            return np.zeros((0,), dtype=bool)
-
-        delete_mask = np.zeros((Nm,), dtype=bool)
-
-        # thresholds
-        free_margin = float(getattr(self, "_free_space_margin_m", 0.09))
-
-        # ============================================================
-        # (1) Femto view pruning
-        # ============================================================
-        if femto_depth_u16 is not None:
-            # depth -> z-buffer (meters)
-            zbuf_f = self._zmin_from_depth_u16(femto_depth_u16, z_unit=femto_z_unit)
-            if isinstance(zbuf_f, torch.Tensor):
-                zbuf_f = zbuf_f.detach().cpu().numpy()
-            zbuf_f = np.asarray(zbuf_f, dtype=np.float32)
-
-            use_cache = (
-                hasattr(self, "_mem_u") and hasattr(self, "_mem_v") and hasattr(self, "_mem_zcam")
-                and (self._mem_u is not None) and (self._mem_v is not None) and (self._mem_zcam is not None)
-                and (len(self._mem_u) == Nm) and (len(self._mem_v) == Nm) and (len(self._mem_zcam) == Nm)
-            )
-
-            if use_cache:
-                # cached: u,v int / zcam in meters
-                u_f = np.asarray(self._mem_u, dtype=np.int32)
-                v_f = np.asarray(self._mem_v, dtype=np.int32)
-                z_f = np.asarray(self._mem_zcam, dtype=np.float32)
-            else:
-                # fallback: project mem_xyz to femto
-                u_f, v_f, z_f, in_idx = self._project_base_to_cam_torch(mem_xyz_base)
-                # make sure numpy types
-                if isinstance(u_f, torch.Tensor): u_f = u_f.detach().cpu().numpy()
-                if isinstance(v_f, torch.Tensor): v_f = v_f.detach().cpu().numpy()
-                if isinstance(z_f, torch.Tensor): z_f = z_f.detach().cpu().numpy()
-                u_f = np.asarray(u_f, dtype=np.int32)
-                v_f = np.asarray(v_f, dtype=np.int32)
-                z_f = np.asarray(z_f, dtype=np.float32)
-
-            # gather current depth at projected pixels
-            z_now_f = self._gather_zbuf_np(zbuf_f, u_f, v_f)
-
-            # free-space delete rule:
-            # if current depth valid and mem point is strictly in front of observed surface by margin
-            # => point lies in free space -> delete
-            del_f = (z_now_f > 0.0) & (z_f > 0.0) & (z_f < (z_now_f - free_margin))
-            delete_mask |= del_f
-
-            # ---------------- HIT MASK (optional) ----------------
-            # hit_margin = float(getattr(self, "_hit_margin_m", 0.015))
-            # hit_f = (z_now_f > 0.0) & (z_f > 0.0) & (np.abs(z_f - z_now_f) <= hit_margin)
-            # self._last_hit_mask_femto = hit_f
-
-        # ============================================================
-        # (2) D405 view pruning (dynamic extrinsics, cannot cache across frames)
-        # ============================================================
-        if (
-            d405_depth_u16 is not None
-            and d405_cam_to_base is not None
-            and K_d405 is not None
-            and d405_wh is not None
-        ):
-            zbuf_d = self._zmin_from_depth_u16(d405_depth_u16, z_unit=d405_z_unit)
-            if isinstance(zbuf_d, torch.Tensor):
-                zbuf_d = zbuf_d.detach().cpu().numpy()
-            zbuf_d = np.asarray(zbuf_d, dtype=np.float32)
-
-            W_d, H_d = int(d405_wh[0]), int(d405_wh[1])
-
-            # base -> d405 cam
-            T_base_cam = np.asarray(d405_cam_to_base, dtype=np.float64)
-            T_cam_base = np.linalg.inv(T_base_cam)
-
-            xyz = mem_xyz_base.astype(np.float64, copy=False)
-            xyz_h = np.concatenate([xyz, np.ones((Nm, 1), dtype=np.float64)], axis=1)
-            xyz_cam = (T_cam_base @ xyz_h.T).T[:, :3].astype(np.float32, copy=False)
-
-            # pinhole projection (no distortion)
-            fx = float(K_d405[0, 0]); fy = float(K_d405[1, 1])
-            cx = float(K_d405[0, 2]); cy = float(K_d405[1, 2])
-
-            z = xyz_cam[:, 2]
-            valid = z > 0.0
-            u = np.full((Nm,), -1, dtype=np.int32)
-            v = np.full((Nm,), -1, dtype=np.int32)
-            if np.any(valid):
-                x = xyz_cam[valid, 0]
-                y = xyz_cam[valid, 1]
-                zz = z[valid]
-                u_proj = np.rint((x / zz) * fx + cx).astype(np.int32)
-                v_proj = np.rint((y / zz) * fy + cy).astype(np.int32)
-                u[valid] = u_proj
-                v[valid] = v_proj
-
-            # gather d405 depth at projected pixels
-            # NOTE: zbuf_d shape should match depth image (H,W). We trust that.
-            z_now_d = self._gather_zbuf_np(zbuf_d, u, v)
-
-            del_d = (z_now_d > 0.0) & (z > 0.0) & (z < (z_now_d - free_margin))
-            delete_mask |= del_d
-
-            # ---------------- HIT MASK (optional) ----------------
-            # hit_margin = float(getattr(self, "_hit_margin_m", 0.015))
-            # hit_d = (z_now_d > 0.0) & (z > 0.0) & (np.abs(z - z_now_d) <= hit_margin)
-            # self._last_hit_mask_d405 = hit_d
-
-        return delete_mask
-
-    # ----------------------------
-    # public: process / process_wrist / process_global
-    # ----------------------------
-    def process(self, points):
-        if points is None or len(points) == 0:
-            if self.enable_temporal and self.export_mode == 'fused':
-                self._frame_idx += 1
-                return np.zeros((0, 7), dtype=np.float32)
-            return np.zeros((self.target_num_points, 6), dtype=np.float32)
-
-        points = points.astype(np.float32, copy=False)
-
-        if self.enable_transform:
-            points = self._apply_transform(points)
-        if self.enable_cropping:
-            points = self._crop_workspace(points)
-        if self.enable_filter:
-            points = self._apply_variance_filter(points)
-
-        if (not self.enable_temporal) or (self.export_mode != "fused"):
-            if self.enable_sampling:
-                points = self._sample_points(points)
-            return points
-
-        now_step = self._frame_idx
-
-        if self.enable_occlusion_prune:
-            self._occlusion_prune_memory_fast(points[:, :3])
-
-        xyz_now = points[:, :3]
-        rgb_now = points[:, 3:6]
-
-        xyz_now, rgb_now, keys_new = self._frame_unique_torch(xyz_now, rgb_now)
-        self._merge_into_mem(xyz_now, rgb_now, now_step, keys_new=keys_new)
-        self._prune_mem(now_step)
-
-        out = self._export_array_from_mem(now_step)
-        self._frame_idx += 1
-        return out
-
-    def process_wrist(self, points, dynamic_extrinsics=None, dynamic_extrinsics_is_cam_to_base: bool = True):
-        """
-        wrist(D405) 포인트클라우드용.
-        - dynamic_extrinsics: (4,4)
-          기본은 cam_to_base로 가정.
-          만약 base_to_cam을 넘긴다면 dynamic_extrinsics_is_cam_to_base=False 로 호출.
-        """
-        if points is None or len(points) == 0:
+        if self.femto is None:
+            raise RuntimeError("FemtoConfig is required for __call__().")
+        if points is None or points.size == 0:
             return np.zeros((0, 6), dtype=np.float32)
 
-        points = points.astype(np.float32, copy=False)
-        if self.enable_transform and dynamic_extrinsics is not None:
-            T = np.asarray(dynamic_extrinsics, dtype=np.float32)
-            if T.shape != (4, 4):
-                raise ValueError(f"dynamic_extrinsics must be (4,4), got {T.shape}")
-            if not dynamic_extrinsics_is_cam_to_base:
-                T = np.linalg.inv(T).astype(np.float32)
-            points = self._apply_dynamic_transform(points, T)
-        return points
+        pts = points.astype(np.float32, copy=False)
+        xyz = pts[:, :3].astype(np.float64)
 
+        # femto pointcloud는 mm 단위로 가정
+        xyz_m = xyz * 1e-3
+
+        xyz_base = transform_points(self.femto.cam_to_base, xyz_m) if self.enable_TF else xyz_m
+        rgb = pts[:, 3:6].astype(np.float32, copy=False)
+        out = np.concatenate([xyz_base.astype(np.float32), rgb], axis=1)
+        if self.enable_crop and self.enable_TF:
+            out = crop_workspace_points(out, self.workspace_bounds)
+        return out.astype(np.float32, copy=False)
+
+    # ----------------------------
+    # Helpers to build current clouds
+    # ----------------------------
+    def _build_femto_current(self, femto_points, femto_depth):
+        if self.femto is None:
+            raise RuntimeError("FemtoConfig is required for femto mode.")
+        if femto_points is None or femto_depth is None:
+            raise ValueError("femto_points and femto_depth are required in femto/both mode.")
+
+        if self.enable_filter:
+            femto_depth_var = depth_variance_filter(
+                femto_depth,
+                depth_to_meters_fn=_femto_depth_to_meters,
+                ksize=self.femto.var_ksize,
+                std_thresh_m=self.femto.var_std_thresh_m,
+                min_depth_m=self.femto.var_min_depth_m,
+                max_depth_m=self.femto.var_max_depth_m,
+            )
+            femto_points_masked = femto_filter_pointcloud_by_depth_mask(
+                femto_points_cam=femto_points,
+                depth_masked=femto_depth_var,
+                K=self.femto.K,
+                z_consistency_eps_m=0.02,
+                use_z_consistency=True,
+            )
+        else:
+            femto_depth_var = femto_depth
+            femto_points_masked = femto_points
+
+        femto_base = self.__call__(femto_points_masked)
+        view = (femto_depth, _femto_depth_to_meters, self._base_to_femto, self.femto.K, (self.femto.width, self.femto.height))
+        return femto_base, view
+
+    def _build_d405_current(
+        self,
+        d405_depth,
+        d405_color,
+        d405_intrinsics,
+        robot_eef_pose,
+    ):
+        if self.d405 is None:
+            raise RuntimeError("D405Config is required for d405 mode.")
+
+        if d405_depth is None or d405_intrinsics is None or robot_eef_pose is None:
+            raise ValueError("d405_depth, d405_intrinsics, robot_eef_pose are required.")
+
+        if self.enable_filter:
+            d405_depth_var = depth_variance_filter(
+                d405_depth,
+                depth_to_meters_fn=_d405_depth_to_meters,
+                ksize=self.d405.var_ksize,
+                std_thresh_m=self.d405.var_std_thresh_m,
+                min_depth_m=self.d405.var_min_depth_m,
+                max_depth_m=self.d405.var_max_depth_m,
+            )
+        else:
+            d405_depth_var = d405_depth
+
+        pc_d405_cam = d405_depth_to_pointcloud(
+            depth=d405_depth_var,
+            color=d405_color,
+            intrinsics=d405_intrinsics,
+            stride=self.d405.stride,
+        )  # (Nd,6) cam frame meters
+
+        trans = robot_eef_pose[:3]
+        rpy = robot_eef_pose[3:6]
+        T_robot_eef = rise_tf.rot_trans_mat(trans, rpy)              # robot<-eef
+        T_base_eef = self.d405.robot_to_base @ T_robot_eef           # base<-eef
+        d405_cam_to_base = (T_base_eef @ self.d405.d405_cam_to_eef).astype(np.float64)  # base<-cam
+
+        if pc_d405_cam.size > 0:
+            xyz_base = transform_points(d405_cam_to_base, pc_d405_cam[:, :3].astype(np.float64)) if self.enable_TF else pc_d405_cam[:, :3].astype(np.float64)
+            d405_base = np.concatenate([xyz_base.astype(np.float32), pc_d405_cam[:, 3:6].astype(np.float32)], axis=1)
+            if self.enable_crop and self.enable_TF:
+                d405_base = crop_workspace_points(d405_base, self.workspace_bounds)
+        else:
+            d405_base = np.zeros((0, 6), dtype=np.float32)
+
+        view = None
+        if d405_depth is not None and d405_cam_to_base is not None and d405_intrinsics is not None:
+            fx, fy, cx, cy = _parse_intrinsics(d405_intrinsics)
+            K_d = np.array([[fx, 0.0, cx],
+                            [0.0, fy, cy],
+                            [0.0, 0.0, 1.0]], dtype=np.float64)
+            base_to_d405 = np.linalg.inv(d405_cam_to_base).astype(np.float64)
+            H, W = d405_depth.shape[:2]
+            view = (d405_depth, _d405_depth_to_meters, base_to_d405, K_d, (W, H))
+
+        return d405_base, view
+
+    # ----------------------------
+    # Main entry: process_global
+    # ----------------------------
     def process_global(
         self,
-        *,
-        femto_points: np.ndarray,         # (Nf,6) (process 입력과 동일)
-        femto_depth_u16: np.ndarray,      # (Hf,Wf) uint16
-        d405_points_base: np.ndarray,     # (Nd,6) 이미 base로 TF된 D405 PC
-        d405_depth_u16: np.ndarray,       # (Hd,Wd) uint16
-        d405_cam_to_base: np.ndarray,     # (4,4) cam->base (동적)
-        K_d405: np.ndarray,               # (3,3)
-        d405_wh: tuple,                   # (W,H)
-        femto_z_unit: str = "mm",
-        d405_z_unit: str = "mm",
+        sensor_mode: Optional[str] = None,             # override: "femto"|"d405"|"both"
+        # Femto inputs
+        femto_points: Optional[np.ndarray] = None,      # (N,6) in Femto camera frame
+        femto_depth: Optional[np.ndarray] = None,       # (H,W) raw depth image
+
+        # D405 inputs (option A: raw depth + color + intr + pose)
+        d405_depth: Optional[np.ndarray] = None,
+        d405_color: Optional[np.ndarray] = None,
+        d405_intrinsics=None,
+        robot_eef_pose: Optional[np.ndarray] = None,    # (6,) xyz(m)+rpy(rad) in ROBOT frame
+
+        export_mode: str = "fused",                     # "fused" only for now
     ) -> np.ndarray:
         """
-        - (A) Femto PC는 기존 process와 동일하게 TF/crop/filter
-        - (B) D405 PC는 base로 들어온다고 가정하고 crop만 적용
-        - (C) Z-buffer는 depth_u16 자체로 Zmin 생성 (rasterize 안씀, 빠름)
-        - (D) multiview prune: hit_any miss + free-space delete
-        - (E) 현재 프레임(Femto+D405) merge 후 temporal export
+        returns: fused cloud (M,7) in BASE frame: xyz rgb c
         """
-        if not (self.enable_temporal and self.export_mode == "fused"):
-            raise RuntimeError("process_global은 temporal fused 모드에서만 사용하세요.")
-        assert self.use_cuda
+        if export_mode != "fused":
+            raise ValueError("This refactor currently supports export_mode='fused' only.")
 
-        # (1) Femto points preprocess
-        pts_f = np.asarray(femto_points, dtype=np.float32)
-        if pts_f.size > 0:
-            if self.enable_transform:
-                pts_f = self._apply_transform(pts_f)
-            if self.enable_cropping:
-                pts_f = self._crop_workspace(pts_f)
-            if self.enable_filter:
-                pts_f = self._apply_variance_filter(pts_f)
+        sensor_mode_local = sensor_mode or self.sensor_mode
 
-        # (2) D405 points (already base)
-        pts_d = np.asarray(d405_points_base, dtype=np.float32)
-        if pts_d.size > 0 and self.enable_cropping:
-            pts_d = self._crop_workspace(pts_d)
+        # ---- build current clouds (merge용) ----
+        cur_list = []
+        femto_view = None
+        if sensor_mode_local in ("femto", "both"):
+            femto_base, femto_view = self._build_femto_current(femto_points, femto_depth)
+            if femto_base.size > 0:
+                cur_list.append(femto_base)
 
-        # (3) depth -> Zmin (meters)
-        Z_f = self._zmin_from_depth_u16(femto_depth_u16, z_unit=femto_z_unit, patch_radius=self.occl_patch_radius)
-        Z_d = self._zmin_from_depth_u16(d405_depth_u16, z_unit=d405_z_unit, patch_radius=self.occl_patch_radius)
+        d405_view = None
+        if sensor_mode_local in ("d405", "both"):
+            d405_base, d405_view = self._build_d405_current(
+                d405_depth=d405_depth,
+                d405_color=d405_color,
+                d405_intrinsics=d405_intrinsics,
+                robot_eef_pose=robot_eef_pose,
+            )
+            if d405_base.size > 0:
+                cur_list.append(d405_base)
 
-        # (4) D405 base->cam
-        cam_to_base = np.asarray(d405_cam_to_base, dtype=np.float32)
-        if cam_to_base.shape != (4, 4):
-            raise ValueError(f"d405_cam_to_base must be (4,4), got {cam_to_base.shape}")
-        base_to_cam_d = np.linalg.inv(cam_to_base).astype(np.float32)
-
-        Wd, Hd = int(d405_wh[0]), int(d405_wh[1])
-
-        # (5) multiview prune/miss update
-        self._occlusion_prune_memory_multiview(
-            Z_f=Z_f,
-            Z_d=Z_d,
-            base_to_cam_d=base_to_cam_d,
-            K_d=np.asarray(K_d405, dtype=np.float32),
-            W_d=Wd,
-            H_d=Hd,
-        )
-
-        # (6) merge current frame to global
-        if pts_f.size == 0 and pts_d.size == 0:
-            now_step = self._frame_idx
-            out = self._export_array_from_mem(now_step)
-            self._frame_idx += 1
-            return out
-        if pts_f.size and pts_d.size:
-            pts_now = np.concatenate([pts_f, pts_d], axis=0)
+        # current concat
+        if len(cur_list) == 0:
+            current = np.zeros((0, 6), dtype=np.float32)
+        elif len(cur_list) == 1:
+            current = cur_list[0]
         else:
-            pts_now = pts_f if pts_f.size else pts_d
+            current = np.concatenate(cur_list, axis=0).astype(np.float32, copy=False)
 
-        xyz_now = pts_now[:, :3]
-        rgb_now = pts_now[:, 3:6]
+        # ---- temporal update ----
+        if not self.enable_temporal:
+            # confidence 없이 fused 반환(visual 호환 위해 c=1)
+            if current.size == 0:
+                return np.zeros((0, 7), dtype=np.float32)
+            c = np.ones((current.shape[0], 1), dtype=np.float32)
+            return np.concatenate([current, c], axis=1).astype(np.float32)
 
-        now_step = self._frame_idx
-        xyz_now, rgb_now, keys_new = self._frame_unique_torch(xyz_now, rgb_now)
-        self._merge_into_mem(xyz_now, rgb_now, now_step, keys_new=keys_new)
-        self._prune_mem(now_step)
+        # 1) decay memory confidence + drop low c
+        mem = self._memory
+        if mem.size > 0:
+            mem = mem.copy()
+            mem[:, 6] *= self.temporal_decay
+            mem = mem[mem[:, 6] >= self.c_min]
 
-        out = self._export_array_from_mem(now_step)
-        self._frame_idx += 1
-        return out
+        # 2) prune old memory using raw depth views (depth==0 => unknown => keep)
+        views = []
+        if femto_view is not None:
+            views.append(("femto",) + femto_view)
+        if d405_view is not None:
+            views.append(("d405",) + d405_view)
 
-    # ----------------------------
-    # geometry preprocess
-    # ----------------------------
-    def _apply_transform(self, points):
-        # NOTE: 기존 코드 그대로 유지 (입력 xyz가 mm라고 가정하고 0.001)
-        points = points[points[:, 2] > 0.0]
-        if len(points) == 0:
-            return points
+        if mem.size > 0 and len(views) > 0:
+            mem = self._occlusion_prune_memory_with_raw_depth(mem, views, margin_m=self.free_space_margin_m)
 
-        point_xyz = points[:, :3] * 0.001  # mm -> m
-        point_homogeneous = np.hstack((point_xyz, np.ones((point_xyz.shape[0], 1), dtype=point_xyz.dtype)))
-        point_transformed = np.dot(point_homogeneous, self.extrinsics_matrix.T)
+        # 3) merge current into memory (voxel unique, current wins)
+        fused = self._voxel_merge_memory_and_current(mem, current)
 
-        points[:, :3] = point_transformed[:, :3].astype(np.float32, copy=False)
-        return points
-
-    def _apply_dynamic_transform(self, points, dynamic_extrinsics):
-        points = points[points[:, 2] > 0.0]
-        if len(points) == 0:
-            return points
-        point_xyz = points[:, :3]
-        point_homogeneous = np.hstack((point_xyz, np.ones((point_xyz.shape[0], 1), dtype=point_xyz.dtype)))
-        point_transformed = np.dot(point_homogeneous, dynamic_extrinsics.T)
-        points[:, :3] = point_transformed[:, :3]
-        return points
-
-    def _crop_workspace(self, points):
-        if len(points) == 0:
-            return points
-        mask = (
-            (points[:, 0] >= self.workspace_bounds[0][0]) &
-            (points[:, 0] <= self.workspace_bounds[0][1]) &
-            (points[:, 1] >= self.workspace_bounds[1][0]) &
-            (points[:, 1] <= self.workspace_bounds[1][1]) &
-            (points[:, 2] >= self.workspace_bounds[2][0]) &
-            (points[:, 2] <= self.workspace_bounds[2][1])
-        )
-        return points[mask]
-    
-    
-
+        self._memory = fused
+        return fused
 
     # ----------------------------
-    # variance filter / sampling (기존 유지)
+    # Internals
     # ----------------------------
-    def _apply_variance_filter(self, points):
-        if len(points) == 0:
-            raise ValueError("points empty")
 
-        xyz = points[:, :3]
-        u, v, z, idx = self._project_base_to_cam_torch(xyz)
-        if len(u) == 0:
-            return points
+    def _occlusion_prune_memory_with_raw_depth(
+        self,
+        memory_xyzrgbc: np.ndarray,  # (M,7) in BASE
+        views,                       # list of ("name", depth_raw, depth_to_m_fn, base_to_cam, K, (W,H))
+        margin_m: float,
+    ) -> np.ndarray:
+        """
+        Free-space carving rule (conservative, raw depth 기반):
+          - memory point를 camera로 투영해서 (u,v,z_mem) 계산
+          - current depth z_cur가 0이면 unknown -> prune 근거 없음 -> keep
+          - z_cur > z_mem + margin 이면 그 ray는 memory point까지 free-space로 관측됨 -> delete
+          - else keep
+        Multi-view 결합: "any view에서 delete 조건 만족하면 delete"
+        """
+        if memory_xyzrgbc.size == 0:
+            return memory_xyzrgbc
 
-        Z = self._rasterize_min_float_torch(u, v, z, self._depth_h, self._depth_w)
-        kernel_size = int(self.variance_kernel_size)
-        variance_threshold = float(self.variance_threshold) * 1e-6  # mm^2 -> m^2
+        xyz_base = memory_xyzrgbc[:, :3].astype(np.float64, copy=False)
+        keep = np.ones((xyz_base.shape[0],), dtype=bool)
 
-        valid_mask = Z > 0
-        depth_zero_filled = np.where(valid_mask, Z, 0).astype(np.float32, copy=False)
+        for (_, depth_raw, depth_to_m_fn, base_to_cam, K, (W, H)) in views:
+            if not np.any(keep):
+                break
 
-        ksize = (kernel_size, kernel_size)
-        depth_sum = cv2.boxFilter(depth_zero_filled, -1, ksize, normalize=False)
-        valid_count = cv2.boxFilter(valid_mask.astype(np.float32), -1, ksize, normalize=False)
-        valid_count_safe = np.maximum(valid_count, 1.0)
+            idx = np.flatnonzero(keep)
+            xyz_cam = transform_points(base_to_cam, xyz_base[idx])  # meters
+            u, v, z_mem = _project_points_to_pixels(xyz_cam, K, W, H)
+            if u.size == 0:
+                continue
 
-        mean = depth_sum / valid_count_safe
-        depth_sq_sum = cv2.boxFilter(depth_zero_filled ** 2, -1, ksize, normalize=False)
-        sq_mean = depth_sq_sum / valid_count_safe
-        variance = sq_mean - mean ** 2
+            # z_mem은 idx subset에서 valid만 남은 상태라서, 다시 매칭이 필요
+            # 간단하게: valid projection mask를 다시 만들어 index mapping 하는 방식
+            # -> 구현을 깔끔하게 하려면 한 번 더 전체를 projection해서 mask 얻는게 안정적이지만,
+            #    여기서는 idx subset 기준으로 진행.
 
-        keep_mask_2d = (variance < variance_threshold) & valid_mask
+            # subset 기준으로 다시 projection mask를 얻기 위해 동일 계산을 재수행
+            fx, fy, cx, cy = float(K[0,0]), float(K[1,1]), float(K[0,2]), float(K[1,2])
+            x = xyz_cam[:, 0].astype(np.float32, copy=False)
+            y = xyz_cam[:, 1].astype(np.float32, copy=False)
+            z = xyz_cam[:, 2].astype(np.float32, copy=False)
 
-        u_idx = np.clip(np.round(u).astype(int), 0, self._depth_w - 1)
-        v_idx = np.clip(np.round(v).astype(int), 0, self._depth_h - 1)
+            valid = z > 1e-6
+            if not np.any(valid):
+                continue
 
-        projected_keep = keep_mask_2d[v_idx, u_idx] & (np.abs(z - Z[v_idx, u_idx]) < 1e-3)
-        kept_original_indices = idx[projected_keep]
-        return points[kept_original_indices]
+            uu = np.rint(fx * (x[valid] / z[valid]) + cx).astype(np.int32)
+            vv = np.rint(fy * (y[valid] / z[valid]) + cy).astype(np.int32)
+            zz = z[valid]
 
-    def _sample_points(self, points):
-        if len(points) == 0:
-            return np.zeros((self.target_num_points, 6), dtype=np.float32)
+            inb = (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
+            if not np.any(inb):
+                continue
 
-        if len(points) <= self.target_num_points:
-            padded = np.zeros((self.target_num_points, 6), dtype=np.float32)
-            padded[:len(points)] = points
-            return padded
+            uu = uu[inb]; vv = vv[inb]; zz = zz[inb]
+            idx_valid = idx[np.flatnonzero(valid)][inb]  # memory index (global)
 
-        try:
-            points_xyz = points[:, :3]
-            sampled_xyz, sample_indices = self._farthest_point_sampling(points_xyz, self.target_num_points)
-            if self.use_cuda:
-                sample_indices = sample_indices.cpu().numpy().flatten()
-            else:
-                sample_indices = sample_indices.numpy().flatten()
-            return points[sample_indices]
-        except Exception:
-            indices = np.random.choice(len(points), self.target_num_points, replace=False)
-            return points[indices]
+            z_cur = depth_to_m_fn(depth_raw)[vv, uu]
+            known = z_cur > 0.0
 
-    def _farthest_point_sampling(self, points, num_points):
-        if not PYTORCH3D_AVAILABLE:
-            raise ImportError("pytorch3d not available")
-        points_tensor = torch.from_numpy(points)
-        if self.use_cuda:
-            points_tensor = points_tensor.cuda()
-        points_batch = points_tensor.unsqueeze(0)
-        sampled_points, indices = torch3d_ops.sample_farthest_points(points=points_batch, K=num_points)
-        sampled_points = sampled_points.squeeze(0)
-        indices = indices.squeeze(0)
-        if self.use_cuda:
-            sampled_points = sampled_points.cpu()
-        return sampled_points.numpy(), indices
+            # delete 조건: z_cur > z_mem + margin
+            delete = known & (z_cur > (zz + float(margin_m)))
+            if np.any(delete):
+                keep[idx_valid[delete]] = False
 
+        return memory_xyzrgbc[keep]
 
+    def _voxel_merge_memory_and_current(self, mem_xyzrgbc: np.ndarray, cur_xyzrgb: np.ndarray) -> np.ndarray:
+        """
+        mem: (M,7) base
+        cur: (N,6) base
+        output: (K,7) base
+        - voxel 단위로 unique
+        - current가 voxel 우선(override)
+        """
+        if cur_xyzrgb.size == 0 and mem_xyzrgbc.size == 0:
+            return np.zeros((0, 7), dtype=np.float32)
+
+        if cur_xyzrgb.size == 0:
+            return mem_xyzrgbc.astype(np.float32, copy=False)
+
+        cur = cur_xyzrgb.astype(np.float32, copy=False)
+        cur_c = np.ones((cur.shape[0], 1), dtype=np.float32)
+        cur7 = np.concatenate([cur, cur_c], axis=1)
+
+        if mem_xyzrgbc.size == 0:
+            # voxel unique만 한번
+            keys = voxel_keys_from_xyz(cur7[:, :3].astype(np.float64), self.temporal_voxel_size)
+            rev = np.arange(keys.shape[0]-1, -1, -1)
+            _, first = np.unique(keys[rev], return_index=True)
+            keep = np.sort(rev[first])
+            return cur7[keep]
+
+        # decay/prune된 mem과 current 결합 -> voxel unique (current wins)
+        combined = np.concatenate([mem_xyzrgbc.astype(np.float32, copy=False), cur7], axis=0)
+        keys = voxel_keys_from_xyz(combined[:, :3].astype(np.float64), self.temporal_voxel_size)
+
+        # "last wins"를 위해 reverse unique
+        rev = np.arange(keys.shape[0]-1, -1, -1)
+        _, first = np.unique(keys[rev], return_index=True)
+        keep = np.sort(rev[first])
+
+        return combined[keep].astype(np.float32, copy=False)
 
 
 class LowDimPreprocessor:
@@ -1223,8 +733,6 @@ def create_default_preprocessor(target_num_points=1024, use_cuda=True, verbose=F
 
 
 def downsample_obs_data(obs_data, downsample_factor=3, offset=0):
-
-
     downsampled_data = {}
     for key, value in obs_data.items():
         if isinstance(value, np.ndarray) and value.ndim > 0:
@@ -1232,7 +740,6 @@ def downsample_obs_data(obs_data, downsample_factor=3, offset=0):
             downsampled_data[key] = value[offset::downsample_factor].copy()
         else:
             downsampled_data[key] = value
-
     return downsampled_data
 
 
