@@ -79,11 +79,11 @@ logging:
   group: ${exp_name}
   id: null
   mode: online
-  name: "PCM_cube_stack${now:%Y.%m.%d}- (fused, Filter=ROR, Downsample=4, No offset, batch_size=120)"
+  name: "PCM_cube_stack${now:%Y.%m.%d}- (MODE4 both sensors, fused, Filter=ROR, Downsample=4, No offset, batch_size=120)"
   project: Cube_stack
   resume: true
   tags:
-  - PCM, diffusion_policy, cube_stack
+  - PCM, diffusion_policy, cube_stack, mode4_both
 
 checkpoint:
   save_ckpt: True

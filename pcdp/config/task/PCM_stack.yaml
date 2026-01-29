@@ -42,6 +42,7 @@ dataset:
 
   enable_pc_preprocessing: True
   pc_preprocessor_config:
+    # MODE 4 : Femto + D405, occlusion uses both sensors
     sensor_mode: both
     workspace_bounds:            # [x_min, x_max], [y_min, y_max], [z_min, z_max]
       - [-0.132, 0.715]
@@ -69,7 +70,7 @@ dataset:
       width: 320
       height: 288
       var_ksize: 5
-      var_std_thresh_m: 0.004
+      var_std_thresh_m: 0.008
       var_min_depth_m: 0.00
       var_max_depth_m: 1e6
 
@@ -81,13 +82,13 @@ dataset:
         - [0.0,                   0.0,                   0.0,                  1.0]
       robot_to_base:
         - [1., 0., 0., -0.04]
-        - [0., 1., 0., -0.29]
-        - [0., 0., 1., -0.03]
+        - [0., 1., 0., -0.295]
+        - [0., 0., 1., -0.027]
         - [0., 0., 0.,  1.0]
       stride: 1
       max_depth_m: 0.25
       var_ksize: 5
-      var_std_thresh_m: 0.004
+      var_std_thresh_m: 0.007
       var_min_depth_m: 0.00
       var_max_depth_m: 0.25
 

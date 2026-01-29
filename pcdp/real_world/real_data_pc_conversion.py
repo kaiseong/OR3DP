@@ -143,6 +143,34 @@ def depth_variance_filter(
     return out
 
 
+def fill_depth_mean(
+    depth: np.ndarray,
+    ksize: int = 5,
+    min_count: int = 3,
+):
+    """
+    Fill zero pixels with mean of neighbors if at least min_count valid pixels exist in the window.
+    Used for occlusion pruning depth; keeps dtype of input.
+    """
+    if depth is None:
+        raise ValueError("depth is None")
+    if ksize % 2 == 0:
+        ksize += 1
+
+    depth_f = depth.astype(np.float32, copy=False)
+    valid = (depth_f > 0).astype(np.float32)
+
+    sum_ = cv2.boxFilter(depth_f, ddepth=-1, ksize=(ksize, ksize),
+                         normalize=False, borderType=cv2.BORDER_DEFAULT)
+    cnt_ = cv2.boxFilter(valid, ddepth=-1, ksize=(ksize, ksize),
+                         normalize=False, borderType=cv2.BORDER_DEFAULT)
+
+    filled = np.where(cnt_ >= float(min_count), sum_ / np.maximum(cnt_, 1.0), 0.0)
+    max_val = np.iinfo(depth.dtype).max if depth.dtype.kind == 'u' else np.finfo(depth.dtype).max
+    filled = np.clip(filled, 0, max_val)
+    return filled.astype(depth.dtype, copy=False)
+
+
 def d405_depth_to_pointcloud(
     depth: np.ndarray,
     color: Optional[np.ndarray],
@@ -217,16 +245,19 @@ def femto_filter_pointcloud_by_depth_mask(
     if not np.any(valid_z):
         return np.zeros((0, 6), dtype=np.float32)
 
-    x = xyz_m[:, 0]
-    y = xyz_m[:, 1]
-    u = np.rint(fx * (x / z) + cx).astype(np.int32)
-    v = np.rint(fy * (y / z) + cy).astype(np.int32)
+    x = xyz_m[valid_z, 0]
+    y = xyz_m[valid_z, 1]
+    z_valid = z[valid_z]
+    u = np.rint(fx * (x / z_valid) + cx).astype(np.int32)
+    v = np.rint(fy * (y / z_valid) + cy).astype(np.int32)
 
-    inb = valid_z & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    inb = (u >= 0) & (u < W) & (v >= 0) & (v < H)
     if not np.any(inb):
         return np.zeros((0, 6), dtype=np.float32)
 
-    idx_inb = np.flatnonzero(inb)
+    # mapping back to original indices
+    idx_valid = np.flatnonzero(valid_z)
+    idx_inb = idx_valid[inb]
     u_in = u[inb]
     v_in = v[inb]
 
@@ -238,7 +269,7 @@ def femto_filter_pointcloud_by_depth_mask(
 
     if use_z_consistency:
         depth_m = _femto_depth_to_meters(depth_masked)
-        z_pc = z[inb][ok_pix]
+        z_pc = z_valid[inb][ok_pix]
         z_img = depth_m[v_in[ok_pix], u_in[ok_pix]]
         ok_z = np.abs(z_pc - z_img) <= float(z_consistency_eps_m)
         keep_mask[idx_inb[ok_pix][ok_z]] = True
@@ -308,7 +339,7 @@ class PointCloudPreprocessor:
         workspace_bounds: np.ndarray,
         femto: Optional[FemtoConfig] = None,
         d405: Optional[D405Config] = None,
-        sensor_mode: str = "both",                # "femto"|"d405"|"both"
+        sensor_mode: str = "both",                # "none"|"femto"|"d405"|"both"
         enable_temporal: bool = True,
         enable_TF: bool = True,                   # cam->base transform
         enable_crop: bool = True,                 # workspace crop
@@ -322,7 +353,7 @@ class PointCloudPreprocessor:
         self.workspace_bounds = workspace_bounds.astype(np.float64)
         self.femto = femto
         self.d405 = d405
-        assert sensor_mode in ("femto", "d405", "both")
+        assert sensor_mode in ("none", "femto", "d405", "both")
         self.sensor_mode = sensor_mode
         self.enable_TF = bool(enable_TF)
         self.enable_crop = bool(enable_crop)
@@ -396,7 +427,13 @@ class PointCloudPreprocessor:
             femto_points_masked = femto_points
 
         femto_base = self.__call__(femto_points_masked)
-        view = (femto_depth, _femto_depth_to_meters, self._base_to_femto, self.femto.K, (self.femto.width, self.femto.height))
+        # Occlusion prune는 RAW depth 기준으로 수행하되, 작은 홀은 mean-fill로 메움
+        depth_filled = fill_depth_mean(
+            femto_depth,
+            ksize=max(3, self.femto.var_ksize),
+            min_count=3,
+        )
+        view = (depth_filled, _femto_depth_to_meters, self._base_to_femto, self.femto.K, (self.femto.width, self.femto.height))
         return femto_base, view
 
     def _build_d405_current(
@@ -407,7 +444,7 @@ class PointCloudPreprocessor:
         robot_eef_pose,
     ):
         if self.d405 is None:
-            raise RuntimeError("D405Config is required for d405 mode.")
+            return np.zeros((0, 6), dtype=np.float32), None
 
         if d405_depth is None or d405_intrinsics is None or robot_eef_pose is None:
             raise ValueError("d405_depth, d405_intrinsics, robot_eef_pose are required.")
@@ -440,8 +477,6 @@ class PointCloudPreprocessor:
         if pc_d405_cam.size > 0:
             xyz_base = transform_points(d405_cam_to_base, pc_d405_cam[:, :3].astype(np.float64)) if self.enable_TF else pc_d405_cam[:, :3].astype(np.float64)
             d405_base = np.concatenate([xyz_base.astype(np.float32), pc_d405_cam[:, 3:6].astype(np.float32)], axis=1)
-            if self.enable_crop and self.enable_TF:
-                d405_base = crop_workspace_points(d405_base, self.workspace_bounds)
         else:
             d405_base = np.zeros((0, 6), dtype=np.float32)
 
@@ -462,7 +497,7 @@ class PointCloudPreprocessor:
     # ----------------------------
     def process_global(
         self,
-        sensor_mode: Optional[str] = None,             # override: "femto"|"d405"|"both"
+        sensor_mode: Optional[str] = None,             # override: "none"|"femto"|"d405"|"both"
         # Femto inputs
         femto_points: Optional[np.ndarray] = None,      # (N,6) in Femto camera frame
         femto_depth: Optional[np.ndarray] = None,       # (H,W) raw depth image
@@ -483,24 +518,36 @@ class PointCloudPreprocessor:
 
         sensor_mode_local = sensor_mode or self.sensor_mode
 
-        # ---- build current clouds (merge용) ----
+        # ---- build current clouds (전처리는 항상 수행) ----
         cur_list = []
-        femto_view = None
-        if sensor_mode_local in ("femto", "both"):
-            femto_base, femto_view = self._build_femto_current(femto_points, femto_depth)
-            if femto_base.size > 0:
-                cur_list.append(femto_base)
 
+        # Femto
+        femto_view = None
+        if (self.femto is not None) and (femto_points is not None) and (femto_depth is not None):
+            femto_base, femto_view = self._build_femto_current(femto_points, femto_depth)
+        elif (self.femto is not None) and (femto_points is not None):
+            femto_base, femto_view = self.__call__(femto_points), None
+        else:
+            femto_base, femto_view = np.zeros((0, 6), dtype=np.float32), None
+
+        # D405
         d405_view = None
-        if sensor_mode_local in ("d405", "both"):
+        if (self.d405 is not None):
             d405_base, d405_view = self._build_d405_current(
                 d405_depth=d405_depth,
                 d405_color=d405_color,
                 d405_intrinsics=d405_intrinsics,
                 robot_eef_pose=robot_eef_pose,
             )
-            if d405_base.size > 0:
-                cur_list.append(d405_base)
+        else:
+            d405_base, d405_view = np.zeros((0, 6), dtype=np.float32), None
+
+        # sensor_mode에 따라 current에 포함
+        # 순서: d405 먼저, femto 나중 → 같은 voxel일 때 femto가 current 내부에서 우선
+        if d405_base.size > 0 and sensor_mode_local in ("d405", "both", "femto", "none"):
+            cur_list.append(d405_base)
+        if femto_base.size > 0 and sensor_mode_local in ("femto", "both", "d405", "none"):
+            cur_list.append(femto_base)
 
         # current concat
         if len(cur_list) == 0:
@@ -510,13 +557,11 @@ class PointCloudPreprocessor:
         else:
             current = np.concatenate(cur_list, axis=0).astype(np.float32, copy=False)
 
-        # ---- temporal update ----
-        if not self.enable_temporal:
-            if current.size == 0:
-                return np.zeros((0, 7), dtype=np.float32)
-            c = np.ones((current.shape[0], 1), dtype=np.float32)
-            return np.concatenate([current, c], axis=1).astype(np.float32)
+        # PCM 비활성 시 confidence 채널 없이 (N,6) 반환
+        if sensor_mode_local == "none" or (not self.enable_temporal):
+            return current.astype(np.float32, copy=False)
 
+        # ---- temporal update ----
         # 1) decay memory confidence + drop low c
         mem = self._memory
         if mem.size > 0:
@@ -526,9 +571,9 @@ class PointCloudPreprocessor:
 
         # 2) prune old memory using raw depth views (depth==0 => unknown => keep)
         views = []
-        if femto_view is not None:
+        if femto_view is not None and sensor_mode_local in ("femto", "both"):
             views.append(("femto",) + femto_view)
-        if d405_view is not None:
+        if d405_view is not None and sensor_mode_local in ("d405", "both"):
             views.append(("d405",) + d405_view)
 
         if mem.size > 0 and len(views) > 0:
@@ -630,8 +675,8 @@ class LowDimPreprocessor:
         if robot_to_base is None:
             self.robot_to_base=np.array([
                 [1., 0., 0., -0.04],
-                [0., 1., 0., -0.29],
-                [0., 0., 1., -0.03],
+                [0., 1., 0., -0.295],
+                [0., 0., 1., -0.027],
                 [0., 0., 0.,  1.0]
             ])
         else:
